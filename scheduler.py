@@ -11,6 +11,7 @@ from threading import Lock
 from contextlib import asynccontextmanager
 from fastapi.responses import StreamingResponse
 
+
 MODEL_ROUTES = {
     "Qwen/Qwen3-4B": [
         # "http://localhost:8105",
@@ -322,7 +323,7 @@ async def proxy_completion(request: Request, id: str):
 
 
 if __name__ == "__main__":
-    # --- POLÍTICAS DE ROTEAMENTO ---
+    # --- POLÝTICAS DE ROTEAMENTO ---
     ROUTING_MODE = "kv_limit"     # opções: "kv_limit" | "min_waiting"
     KV_CACHE_THRESHOLD = 90.0      # só envia se KV < 95%
     STALE_TIMEOUT = 30.0           # tempo limite em segundos para considerar métricas atualizadas
