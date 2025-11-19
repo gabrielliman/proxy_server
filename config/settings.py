@@ -23,5 +23,15 @@ METRICS_TIMEOUT = 1.5
 DISPATCH_MODE = "worker_pool"  # "direct", "worker_pool", "semaphore"
 
 BACKEND_PARALLELISM = {
-    "http://localhost:8106": 10,
+    "http://localhost:8106": 15, #50% a mais que o paralelismo real
 }
+
+# Process table pruning (seconds)
+PROCESS_TABLE_PRUNE_TTL = 600  # default 10 minutes
+PROCESS_TABLE_PRUNE_INTERVAL = 60  # run pruner every 60 seconds
+
+# Scheduler selection: 'fcfs' (default), 'plas', ...
+SCHEDULER = "fcfs"
+PLAS_EWMA_ALPHA = 0.3
+PLAS_AGE_WEIGHT = 0.5
+PLAS_PRIORITY_BASE = 1.0

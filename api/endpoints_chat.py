@@ -6,6 +6,8 @@ import asyncio
 from config.settings import MODEL_ROUTES, DISPATCH_MODE
 from routing.selector import select_best_backend, backend_metrics
 from logs.logger import print_backend_status
+from uuid import uuid4
+from routing.process_table import PROCESS_TABLE
 
 # Fila unificada
 from routing.queue_manager import init_queues
@@ -58,6 +60,10 @@ async def chat_completion(id: str, request: Request):
         if backend is None:
             await asyncio.sleep(1)
 
+    # instrument arrival (program id = path param `id`)
+    call_id = str(uuid4())
+    PROCESS_TABLE.record_call_arrival(id, call_id)
+
     disp = get_dispatcher()
 
-    return await disp.dispatch(backend, data)
+    return await disp.dispatch(backend, data, program_id=id, call_id=call_id)
