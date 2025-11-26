@@ -44,6 +44,7 @@ class ProcessTable:
                 "service_time": 0.0,
                 "engine_id": None,
                 "state": "waiting",
+                #salvar numero de tokens de entrada
             }
             entry["most_recent_call_arrival"] = now
 

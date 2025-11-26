@@ -1,3 +1,7 @@
 __pycache__/
 .vscode/
 TODO
+.pytest_cache/
+process.txt
+saida_VLLM_8001.txt
+benchmark_results.json
