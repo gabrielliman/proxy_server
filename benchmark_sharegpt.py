@@ -439,4 +439,5 @@ if __name__ == "__main__":
             json.dump(to_save, f, indent=2)
         print(f"\nSaved metrics JSON to: {out_path}")
 
-# python benchmark_sharegpt.py --base-url http://localhost:8080 --dataset /scratch/global/datasets/ShareGPT_V3_unfiltered_cleaned_split.json --limit 100 --model Qwen/Qwen3-4B
+# python benchmark_sharegpt.py --base-url http://localhost:8080 --dataset /scratch/global/datasets/ShareGPT_V3_unfiltered_cleaned_split.json --limit 100 --model Qwen/Qwen3-4B --output-json benchmark_results.json
+# python benchmark_sharegpt.py --base-url http://localhost:8080 --dataset /scratch/global/proxy_server/benchmark/programs_dataset.json --limit 100 --model Qwen/Qwen3-4B --output-json benchmark_results[FCFS][LARGE_PROGRAMS].json
