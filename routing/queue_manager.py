@@ -33,6 +33,37 @@ class PriorityQueueWrapper:
         return self._pq.empty()
 
 
+class DiscretizedQueueWrapper:
+    """K discrete priority queues (Q1, Q2, ..., QK) with FCFS within each.
+    
+    Q1 = highest priority (index 0), QK = lowest priority (index K-1).
+    Each queue is an asyncio.Queue; dequeue always selects from highest non-empty queue.
+    """
+    def __init__(self, num_buckets: int):
+        self.num_buckets = num_buckets
+        self.queues = [asyncio.Queue() for _ in range(num_buckets)]
+
+    async def put(self, queue_index: int, item: Any):
+        """Enqueue item to specified queue index (0 = Q1, highest priority)."""
+        idx = min(max(queue_index, 0), self.num_buckets - 1)
+        await self.queues[idx].put(item)
+
+    async def get(self) -> Any:
+        """Dequeue from highest non-empty queue (Q1, Q2, ...)."""
+        while True:
+            for qi in range(self.num_buckets):
+                if not self.queues[qi].empty():
+                    return await self.queues[qi].get()
+            # All queues empty, wait a bit and retry
+            await asyncio.sleep(0.001)
+
+    def qsize(self) -> int:
+        return sum(q.qsize() for q in self.queues)
+
+    def empty(self) -> bool:
+        return all(q.empty() for q in self.queues)
+
+
 def init_queues():
     """Inicializa filas para todos os backends.
     Chamada automática na primeira importação do dispatcher.
@@ -43,8 +74,13 @@ def init_queues():
         return
 
     if SCHEDULER == "plas":
-        backend_queues = {backend: PriorityQueueWrapper() for backend in ALL_BACKENDS}
+        from config.settings import DISCRETIZED_PRIORITY_BUCKETS
+        backend_queues = {
+            backend: DiscretizedQueueWrapper(DISCRETIZED_PRIORITY_BUCKETS)
+            for backend in ALL_BACKENDS
+        }
     else:
+        # FCFS: plain asyncio.Queue
         backend_queues = {backend: asyncio.Queue() for backend in ALL_BACKENDS}
 
 
@@ -55,17 +91,25 @@ def get_queue(backend: str):
 
 async def put_request(backend: str, priority: float, item: Any):
     q = get_queue(backend)
-    # PriorityQueueWrapper exposes put(priority, item); asyncio.Queue expects single item
-    if SCHEDULER == "plas" and hasattr(q, "put"):
+    # DiscretizedQueueWrapper for PLAS: map priority to queue index
+    if SCHEDULER == "plas" and isinstance(q, DiscretizedQueueWrapper):
+        from routing.scheduler_plas import map_priority_to_queue_index
+        from config.settings import DISCRETIZED_PRIORITY_BUCKETS, DISCRETIZED_PRIORITY_BASE
+        queue_idx = map_priority_to_queue_index(priority, DISCRETIZED_PRIORITY_BUCKETS, DISCRETIZED_PRIORITY_BASE)
+        await q.put(queue_idx, item)
+    elif SCHEDULER == "plas":
+        # fallback to direct priority (shouldn't happen but safe)
         await q.put(priority, item)
     else:
-        # fallback: ignore priority and enqueue item
+        # FCFS: ignore priority
         await q.put(item)
 
 
 async def get_request(backend: str):
     q = get_queue(backend)
-    if SCHEDULER == "plas" and hasattr(q, "get") and isinstance(q, PriorityQueueWrapper):
+    # DiscretizedQueueWrapper scans K queues from highest priority down
+    if SCHEDULER == "plas" and isinstance(q, DiscretizedQueueWrapper):
         return await q.get()
     else:
+        # FCFS: plain asyncio.Queue.get()
         return await q.get()

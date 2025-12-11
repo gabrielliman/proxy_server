@@ -22,6 +22,7 @@ class SemaphoreDispatcher(BaseDispatcher):
             self.clients[backend] = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
 
     async def dispatch(self, backend: str, data: dict, program_id: str = None, call_id: str = None) -> dict:
+        from routing.process_table import PROCESS_TABLE
         await self.start_backend(backend)
 
         queue = get_queue(backend)
@@ -29,14 +30,18 @@ class SemaphoreDispatcher(BaseDispatcher):
 
         # Enfileira para contagem
         future = loop.create_future()
-        from routing.process_table import PROCESS_TABLE
         if program_id and call_id:
             PROCESS_TABLE.record_enqueue(program_id, call_id)
 
         item = {"data": data, "future": future, "program_id": program_id, "call_id": call_id}
         if SCHEDULER == "plas":
-            priority, seq = compute_priority(program_id, call_id)
-            await put_request(backend, priority, item)
+            from config.settings import ANTI_STARVATION_RATIO_THRESHOLD
+            if program_id and PROCESS_TABLE.should_promote_to_q1(program_id, ANTI_STARVATION_RATIO_THRESHOLD):
+                PROCESS_TABLE.reset_wait_and_service_for_promotion(program_id)
+                await put_request(backend, 0.0, item)
+            else:
+                priority, seq = compute_priority(program_id, call_id)
+                await put_request(backend, priority, item)
         else:
             await queue.put(item)
 
@@ -52,7 +57,6 @@ class SemaphoreDispatcher(BaseDispatcher):
         pid = item.get("program_id")
         cid = item.get("call_id")
 
-        from routing.process_table import PROCESS_TABLE
         # record dequeue to mark leaving the queue
         if pid and cid:
             PROCESS_TABLE.record_dequeue(pid, cid)
@@ -61,8 +65,6 @@ class SemaphoreDispatcher(BaseDispatcher):
         client = self.clients[backend]
 
         # 🔥 Entrada no semáforo = limite de concorrência real
-        from routing.process_table import PROCESS_TABLE
-
         async with sem:
             start = None
             try:

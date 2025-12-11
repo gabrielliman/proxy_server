@@ -67,3 +67,20 @@ def update_on_completion(program_id: str, service_time: float):
             entry["service_ewma"] = service_time
         else:
             entry["service_ewma"] = alpha * service_time + (1 - alpha) * ewma
+
+
+def map_priority_to_queue_index(priority_value: float, num_buckets: int, base_span: float) -> int:
+    """Map continuous PLAS priority to a discrete queue index.
+    
+    Priority ranges are equal-width from [0, base_span) divided into num_buckets.
+    Index 0 = Q1 (highest priority), index num_buckets-1 = QK (lowest priority).
+    Lower numeric priority_value -> lower index (higher priority).
+    """
+    if priority_value < 0:
+        priority_value = 0
+    if base_span <= 0:
+        base_span = 1.0
+    
+    bucket_width = base_span / num_buckets
+    queue_idx = int(priority_value / bucket_width)
+    return min(queue_idx, num_buckets - 1)  # clamp to max queue index

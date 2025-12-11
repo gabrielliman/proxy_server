@@ -20,18 +20,26 @@ class DirectDispatcher(BaseDispatcher):
     """
 
     async def dispatch(self, backend: str, data: dict, program_id: str = None, call_id: str = None) -> dict:
+        from routing.process_table import PROCESS_TABLE
+        from config.settings import ANTI_STARVATION_RATIO_THRESHOLD
+        
         queue = get_queue(backend)
 
         # Enfileira a requisição (permite contagem real da fila)
         future = asyncio.get_running_loop().create_future()
-        from routing.process_table import PROCESS_TABLE
         if program_id and call_id:
             PROCESS_TABLE.record_enqueue(program_id, call_id)
 
         item = {"data": data, "future": future, "program_id": program_id, "call_id": call_id}
         if SCHEDULER == "plas":
-            priority, seq = compute_priority(program_id, call_id)
-            await put_request(backend, priority, item)
+            from config.settings import ANTI_STARVATION_RATIO_THRESHOLD
+            # Anti-starvation: if program qualifies, promote to Q1 by using priority 0.0
+            if program_id and PROCESS_TABLE.should_promote_to_q1(program_id, ANTI_STARVATION_RATIO_THRESHOLD):
+                PROCESS_TABLE.reset_wait_and_service_for_promotion(program_id)
+                await put_request(backend, 0.0, item)
+            else:
+                priority, seq = compute_priority(program_id, call_id)
+                await put_request(backend, priority, item)
         else:
             await queue.put(item)
 

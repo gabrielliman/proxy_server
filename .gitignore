@@ -5,3 +5,5 @@ TODO
 process.txt
 saida_VLLM_8001.txt
 benchmark_results.json
+*.json
+*.txt

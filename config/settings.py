@@ -1,6 +1,9 @@
 MODEL_ROUTES = {
-    "Qwen/Qwen3-4B": [
-        "http://localhost:8106"
+    # "Qwen/Qwen3-4B": [
+    #     "http://localhost:8106"
+    # ],
+    "meta-llama/Llama-3.1-8B-Instruct": [
+        "http://localhost:8005"
     ],
 }
 
@@ -23,7 +26,7 @@ METRICS_TIMEOUT = 1.5
 DISPATCH_MODE = "worker_pool"  # "direct", "worker_pool", "semaphore"
 
 BACKEND_PARALLELISM = {
-    "http://localhost:8106": 15, #50% a mais que o paralelismo real
+    "http://localhost:8005": 15, #50% a mais que o paralelismo real
 }
 
 # Process table pruning (seconds)
@@ -35,3 +38,8 @@ SCHEDULER = "plas"
 PLAS_EWMA_ALPHA = 0.3
 PLAS_AGE_WEIGHT = 0.5
 PLAS_PRIORITY_BASE = 1.0
+
+# Discretized priority queues for PLAS (Autellix-style)
+DISCRETIZED_PRIORITY_BUCKETS = 10  # K: number of priority levels
+DISCRETIZED_PRIORITY_BASE = PLAS_PRIORITY_BASE * 2  # span to discretize (adjust as needed)
+ANTI_STARVATION_RATIO_THRESHOLD = 0.5  # beta: W_total/T_total >= threshold triggers promotion to Q1

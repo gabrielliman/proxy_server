@@ -270,6 +270,42 @@ class ProcessTable:
             self._pruner_task.cancel()
             self._pruner_task = None
 
+    def should_promote_to_q1(self, program_id: str, beta_threshold: float = 0.5) -> bool:
+        """Check if program should be promoted to highest priority queue (Q1).
+        Promotion occurs when W_total / T_total >= beta_threshold.
+        - W_total = waiting_time_cumulative (time spent waiting for backend)
+        - T_total = service_time_cumulative (time spent executing on backend)
+        """
+        with self.lock:
+            entry = self.table.get(program_id)
+            if not entry:
+                return False
+            
+            w_total = entry.get("waiting_time_cumulative", 0.0)
+            t_total = entry.get("service_time_cumulative", 0.0)
+            
+            if t_total == 0:
+                # No service time yet; if waiting, consider promoting
+                return w_total > 0
+            
+            ratio = w_total / t_total
+            return ratio >= beta_threshold
+
+    def reset_wait_and_service_for_promotion(self, program_id: str):
+        """Reset per-call metrics (W_c, T_c) when promoting to Q1.
+        Per Autellix paper, promotion resets the call-level waiting and service times,
+        but keeps the program-level aggregates (W_p, T_p) unchanged.
+        For simplicity, we reset the cumulative counters to encourage fairness.
+        """
+        with self.lock:
+            entry = self.table.get(program_id)
+            if not entry:
+                return
+            
+            # Reset cumulative waiting and service time to restart the ratio check
+            entry["waiting_time_cumulative"] = 0.0
+            entry["service_time_cumulative"] = 0.0
+
 
 # Module singleton
 PROCESS_TABLE = ProcessTable()
