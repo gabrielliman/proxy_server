@@ -8,6 +8,8 @@ import aiohttp
 import numpy as np
 from transformers import AutoTokenizer
 from tqdm import tqdm
+REQUEST_SEND_TIMES = []
+REQUEST_SEND_LOCK = asyncio.Lock()
 
 
 # ============================================================
@@ -95,31 +97,54 @@ def summarize_program(prog: ProgramMetrics) -> Dict[str, Any]:
 # HTTP request logic (returns metrics AND output text)
 # ============================================================
 
+from typing import Literal
+
 async def send_request(
     session: aiohttp.ClientSession,
     base_url: str,
     program_id: str,
-    prompt: str,
+    *,
+    mode: Literal["chat", "completion"],
     model_name: str,
     tokenizer,
-    max_tokens: int = 2048,
-    temperature: float = 0.0,
+    max_tokens: int,
+    temperature: float,
+    prompt: str | None = None,
+    messages: List[Dict[str, str]] | None = None,
 ) -> Tuple[RequestMetrics, str]:
 
-    url = f"{base_url}/{program_id}/v1/completions"
+    if mode == "completion":
+        url = f"{base_url}/{program_id}/v1/completions"
+        payload = {
+            "model": model_name,
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        input_text = prompt or ""
 
-    payload = {
-        "model": model_name,
-        "prompt": prompt,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
+    elif mode == "chat":
+        url = f"{base_url}/{program_id}/v1/chat/completions"
+        payload = {
+            "model": model_name,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        input_text = "\n".join(m["content"] for m in (messages or []))
 
+    else:
+        raise ValueError(f"Invalid mode: {mode}")
+
+    # ---------------------------
+    # Token estimation (aligned with your LB)
+    # ---------------------------
     input_tokens = len(
-        tokenizer(prompt, add_special_tokens=False).input_ids
+        tokenizer(input_text, add_special_tokens=False).input_ids
     )
 
     start = time.perf_counter()
+
     try:
         async with session.post(url, json=payload) as resp:
             resp_text = await resp.text()
@@ -130,45 +155,51 @@ async def send_request(
                 )
 
             result = json.loads(resp_text)
-            full_latency = time.perf_counter() - start
+            latency = time.perf_counter() - start
 
-            text = ""
-            try:
+            # ---------------------------
+            # Output parsing
+            # ---------------------------
+            if mode == "completion":
                 text = result["choices"][0].get("text", "")
                 if not text and "message" in result["choices"][0]:
-                    text = result["choices"][0]["message"].get("content", "")
-            except:
-                raise RuntimeError(f"Unexpected response format: {result}")
+                    text = result["choices"][0]["message"]["content"]
+            else:
+                text = result["choices"][0]["message"]["content"]
 
             output_tokens = len(
                 tokenizer(text, add_special_tokens=False).input_ids
             )
 
+            # ---------------------------
+            # Approx timing model
+            # ---------------------------
             if output_tokens > 0:
                 ttft = 0.001
                 if output_tokens > 1:
-                    per_token = (full_latency - ttft) / (output_tokens - 1)
+                    per_token = (latency - ttft) / (output_tokens - 1)
                     itl = [per_token] * (output_tokens - 1)
                 else:
                     itl = []
             else:
-                ttft = full_latency
+                ttft = latency
                 itl = []
 
             return (
                 RequestMetrics(
                     ttft=ttft,
-                    latency=full_latency,
+                    latency=latency,
                     itl=itl,
                     output_tokens=output_tokens,
                     input_tokens=input_tokens,
                 ),
-                text
+                text,
             )
 
     except Exception as e:
         print(f"[ERROR] Request failed for program {program_id}: {e}")
         return RequestMetrics(0.0, 0.0, [], 0, 0), ""
+
 
 
 # ============================================================
@@ -180,40 +211,90 @@ async def send_stateful_request(
     base_url,
     program_id,
     new_user_message,
+    *,
+    mode: Literal["chat", "completion"],
     model_name,
     tokenizer,
-    conversation_state: Dict[str, str],
+    conversation_state: dict,
     max_tokens=2048,
     temperature=0.0,
 ):
 
-    history = conversation_state.get(program_id, "")
+    if mode == "completion":
+        history = conversation_state.get(program_id, "")
+        prompt = new_user_message if history == "" else history + "\n\n" + new_user_message
 
-    if history == "":
-        prompt = new_user_message
-    else:
-        prompt = history + "\n\n" + new_user_message
+        rm, text = await send_request(
+            session=session,
+            base_url=base_url,
+            program_id=program_id,
+            mode=mode,
+            model_name=model_name,
+            tokenizer=tokenizer,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
 
-    rm, output_text = await send_request(
+        conversation_state[program_id] = prompt + "\n\n" + text
+        # print(text)
+        return rm
+
+    # ---------------------------
+    # CHAT MODE
+    # ---------------------------
+    history = conversation_state.get(program_id, [])
+
+    messages = history + [
+        {"role": "user", "content": new_user_message}
+    ]
+
+    rm, text = await send_request(
         session=session,
         base_url=base_url,
         program_id=program_id,
-        prompt=prompt,
+        mode=mode,
         model_name=model_name,
         tokenizer=tokenizer,
+        messages=messages,
         max_tokens=max_tokens,
         temperature=temperature,
     )
 
-    updated_history = prompt #+ "\n\n" + output_text
-    conversation_state[program_id] = updated_history
-
+    messages.append({"role": "assistant", "content": text})
+    conversation_state[program_id] = messages
+    # print(text)
     return rm
+
 
 
 # ============================================================
 # Benchmark orchestration
 # ============================================================
+class RateLimiter:
+    """
+    Simple async rate limiter: allows `rate` acquisitions per second.
+    """
+    def __init__(self, rate: float):
+        self.rate = rate
+        self._interval = 1.0 / rate if rate > 0 else 0.0
+        self._last = time.perf_counter()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self):
+        if self.rate <= 0 or self.rate == float("inf"):
+            return
+
+        async with self._lock:
+            now = time.perf_counter()
+            elapsed = now - self._last
+            wait = self._interval - elapsed
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last = time.perf_counter()
+
+
+
 
 async def run_programs(
     program_requests: List[Tuple[str, List[str]]],
@@ -222,47 +303,50 @@ async def run_programs(
     tokenizer,
     max_concurrency: int,
     rps: float,
+    mode: Literal["chat", "completion"],
 ) -> List[ProgramMetrics]:
 
     if max_concurrency is None or max_concurrency <= 0:
         semaphore = asyncio.Semaphore(1_000_000_000)
     else:
         semaphore = asyncio.Semaphore(max_concurrency)
-
+    rate_limiter = RateLimiter(rps)
     total_requests = sum(len(prompts) for _, prompts in program_requests)
 
     async with aiohttp.ClientSession() as session:
-
-        if rps is None or rps == float("inf") or rps <= 0:
-            delays = [0.0 for _ in program_requests]
-        else:
-            delays = [i / rps for i in range(len(program_requests))]
-        async def run_single_program(pid, prompts, start_delay, pbar):
-
-                if start_delay > 0:
-                    await asyncio.sleep(start_delay)
+        async def run_single_program(pid, prompts, pbar):
 
                 req_metrics = []
                 conversation_state = {}
 
                 for new_message in prompts:
                     # === DEBUG PRINT DO QUE ESTÁ SENDO AO MODELO ===
-                    print(f"\n📨 [PROGRAM {pid}] New user message:")
-                    print("   ", new_message.replace("\n", " ")[:300], "...")
+                    history = conversation_state.get(pid, [])
 
-                    history_preview = conversation_state.get(pid, "")
-                    print(f"   [History length = {len(history_preview)} chars]")
+                    if isinstance(history, list):
+                        # chat mode: list of {role, content}
+                        total_chars = sum(len(m.get("content", "")) for m in history)
+                        # print(f"   [History length = {total_chars} chars | {len(history)} messages]")
+                    # else:
+                        # completion mode: plain string
+                        # print(f"   [History length = {len(history)} chars]")
+                    # print(conversation_state)
 
                     async with semaphore:
+                        await rate_limiter.acquire()
+                        async with REQUEST_SEND_LOCK:
+                            REQUEST_SEND_TIMES.append(time.perf_counter())
                         rm = await send_stateful_request(
                             session=session,
                             base_url=base_url,
                             program_id=pid,
                             new_user_message=new_message,
+                            mode=mode,
                             model_name=model_name,
                             tokenizer=tokenizer,
                             conversation_state=conversation_state,
                         )
+
 
                     req_metrics.append(rm)
                     pbar.update(1)
@@ -272,9 +356,9 @@ async def run_programs(
 
         tasks = []
         with tqdm(total=total_requests, desc="Completed requests") as pbar:
-            for (pid, prompts), delay in zip(program_requests, delays):
+            for pid, prompts in program_requests:
                 tasks.append(asyncio.create_task(
-                    run_single_program(pid, prompts, delay, pbar)
+                    run_single_program(pid, prompts, pbar)
                 ))
 
             return await asyncio.gather(*tasks)
@@ -291,7 +375,9 @@ async def benchmark_sharegpt(
     limit: int | None = None,
     max_concurrency: int | None = 32,
     rps: float = float("inf"),
+    mode: Literal["chat", "completion"] = "completion",
     burstiness: float = 1.0,
+    max_chat_len: int = 2048,
 ):
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -299,26 +385,32 @@ async def benchmark_sharegpt(
     with open(dataset_path, "r", encoding="utf8") as f:
         data = json.load(f)
 
-    if limit is not None:
-        data = data[:limit]
 
-    print("\n============================================")
-    print(f"Loaded {len(data)} programs from ShareGPT dataset")
-    print("============================================\n")
+    # print("\n============================================")
+    # print(f"Loaded {len(data)} programs from ShareGPT dataset")
+    # print("============================================\n")
 
     program_requests = []
     for conv in data:
+        if(len(program_requests)>=limit):
+            break
         pid = conv.get("id", "")
         messages = conv.get("conversations", [])
         user_msgs = [m["value"] for m in messages if m.get("from") == "human"]
         if user_msgs:
-            program_requests.append((pid, user_msgs))
+            # print(pid)
+            # if(len(user_msgs)==2):
+            if(len(user_msgs)>max_chat_len):
+                user_msgs=user_msgs[:max_chat_len]
+                # print(user_msgs)
+                program_requests.append((pid, user_msgs))
+                # break
 
     num_programs = len(program_requests)
     total_requests = sum(len(msgs) for _, msgs in program_requests)
 
-    print(f"Found {num_programs} programs.")
-    print(f"Total requests: {total_requests}\n")
+    # print(f"Found {num_programs} programs.")
+    # print(f"Total requests: {total_requests}\n")
 
     start_wall = time.perf_counter()
 
@@ -329,10 +421,11 @@ async def benchmark_sharegpt(
         tokenizer,
         max_concurrency,
         rps,
+        mode,
     )
 
     total_wall = time.perf_counter() - start_wall
-    print(f"\nBenchmark wall-clock duration: {total_wall:.2f}s\n")
+    # print(f"\nBenchmark wall-clock duration: {total_wall:.2f}s\n")
 
     per_program_metrics = [summarize_program(p) for p in program_results]
 
@@ -343,6 +436,28 @@ async def benchmark_sharegpt(
     full_metrics["benchmark_wall_time_s"] = total_wall
     full_metrics["num_programs"] = num_programs
     full_metrics["total_requests"] = total_requests
+
+
+    def analyze_request_rate(send_times):
+        if len(send_times) < 2:
+            return {}
+
+        send_times = sorted(send_times)
+        intervals = np.diff(send_times)
+
+        observed_rps = 1.0 / np.mean(intervals)
+
+        return {
+            "observed_mean_rps": observed_rps,
+            "mean_interval_s": float(np.mean(intervals)),
+            "p99_interval_s": float(np.percentile(intervals, 99)),
+            "num_samples": len(intervals),
+        }
+
+
+    rate_stats = analyze_request_rate(REQUEST_SEND_TIMES)
+    full_metrics["rate_limiter_validation"] = rate_stats
+
 
     return per_program_metrics, full_metrics
 
@@ -360,10 +475,18 @@ if __name__ == "__main__":
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--max-concurrency", type=int, default=10)
+    parser.add_argument("--max-concurrency", type=int, default=100)
     parser.add_argument("--request-rate", type=float, default=float("inf"))
     parser.add_argument("--burstiness", type=float, default=1.0)
     parser.add_argument("--output-json", type=str, default=None)
+    parser.add_argument("--max_chat_len", type=int, default=2048)
+    parser.add_argument(
+    "--mode",
+    choices=["chat", "completion"],
+    default="chat",
+    help="Which OpenAI-style API to use",
+)
+
 
     args = parser.parse_args()
 
@@ -372,10 +495,12 @@ if __name__ == "__main__":
             dataset_path=args.dataset,
             base_url=args.base_url,
             model_name=args.model,
+            mode=args.mode,
             limit=args.limit,
             max_concurrency=args.max_concurrency,
             rps=args.request_rate,
             burstiness=args.burstiness,
+            max_chat_len=args.max_chat_len,
         )
     )
 
@@ -405,11 +530,4 @@ if __name__ == "__main__":
             json.dump(to_save, f, indent=2)
         print(f"\nSaved metrics JSON to: {out_path}")
 
-
-# python benchmark_stateful.py \
-#   --base-url http://localhost:8080 \
-#   --dataset /scratch/global/datasets/ShareGPT_V3_unfiltered_cleaned_split.json \
-#   --model meta-llama/Llama-3.1-8B-Instruct \
-#   --limit 100 \
-#   --output-json out.json
-# 
+# python benchmark_stateful.py --base-url http://localhost:8080 --dataset /scratch/global/datasets/ShareGPT_V3_unfiltered_cleaned_split.json --model Qwen/Qwen3-4B --limit 20 --output-json request_test.json --request_rate 1

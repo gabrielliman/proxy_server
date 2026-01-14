@@ -18,11 +18,16 @@ class ProcessTable:
                     "waiting_time_cumulative": 0.0,
                     "service_ewma": None,
                     "call_count": 0,
+
+                    # NEW (Autellix Alg.2, line 6)
+                    "preferred_engine": None,
+
                     "engine_ids": set(),
-                    "threads": {},  # call_id -> metadata
+                    "threads": {},
                     "most_recent_call_arrival": None,
                     "most_recent_call_completion": None,
                 }
+
 
     def remove_process(self, program_id: str):
         with self.lock:
@@ -81,14 +86,21 @@ class ProcessTable:
                 return
             th["dequeue_time"] = now
 
-    def record_call_start(self, program_id: str, call_id: str, engine_id: str = None, start_time: float = None):
+    def record_call_start(
+        self,
+        program_id: str,
+        call_id: str,
+        engine_id: str = None,
+        start_time: float = None,
+    ):
         now = start_time or time.time()
         self.ensure_process(program_id)
+
         with self.lock:
             entry = self.table[program_id]
+
             th = entry["threads"].get(call_id)
             if th is None:
-                # If arrival was not recorded, create a minimal thread record
                 th = {
                     "arrival_time": now,
                     "start_time": now,
@@ -101,16 +113,27 @@ class ProcessTable:
                 entry["threads"][call_id] = th
             else:
                 th["start_time"] = now
-                # compute waiting based on enqueue_time if available, else arrival_time
                 base = th.get("enqueue_time") or th.get("arrival_time") or now
                 th["waiting_time"] = max(0.0, now - base)
                 th["state"] = "running"
                 th["engine_id"] = engine_id
 
-            # update process-level aggregates
             entry["waiting_time_cumulative"] += th["waiting_time"]
+
             if engine_id:
                 entry["engine_ids"].add(engine_id)
+
+                # 🔥 Autellix pinning rule:
+                # first long call determines program engine
+                if entry.get("preferred_engine") is None:
+                    entry["preferred_engine"] = engine_id
+
+    def clear_preferred_engine(self, program_id: str):
+        with self.lock:
+            entry = self.table.get(program_id)
+            if entry:
+                entry["preferred_engine"] = None
+
 
     def record_call_completion(self, program_id: str, call_id: str, completion_time: float = None):
         now = completion_time or time.time()
@@ -172,6 +195,7 @@ class ProcessTable:
                 "service_ewma": entry.get("service_ewma"),
                 "call_count": entry.get("call_count", 0),
                 "waiting_time_cumulative": entry["waiting_time_cumulative"],
+                "preferred_engine": entry.get("preferred_engine"),
                 "engine_ids": engine_ids_copy,
                 "threads": threads_copy,
                 "most_recent_call_arrival": entry["most_recent_call_arrival"],
@@ -196,6 +220,7 @@ class ProcessTable:
                 "service_time_cumulative": entry.get("service_time_cumulative", 0.0),
                 "service_time_max": entry.get("service_time_max", 0.0),
                 "waiting_time_cumulative": entry.get("waiting_time_cumulative", 0.0),
+                "preferred_engine": entry.get("preferred_engine"),
                 "engine_ids": engine_ids_copy,
                 "threads": threads_copy,
                 "most_recent_call_arrival": entry.get("most_recent_call_arrival"),
