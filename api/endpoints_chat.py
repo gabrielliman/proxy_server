@@ -96,3 +96,4 @@ async def chat_completion(program_id: str, request: Request):
         program_id=program_id,
         call_id=call_id,
     )
+

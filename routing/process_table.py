@@ -8,7 +8,7 @@ class ProcessTable:
     def __init__(self):
         self.lock = Lock()
         self.table: Dict[str, Dict[str, Any]] = {}
-
+        
     def ensure_process(self, program_id: str):
         with self.lock:
             if program_id not in self.table:
@@ -133,7 +133,6 @@ class ProcessTable:
             entry = self.table.get(program_id)
             if entry:
                 entry["preferred_engine"] = None
-
 
     def record_call_completion(self, program_id: str, call_id: str, completion_time: float = None):
         now = completion_time or time.time()

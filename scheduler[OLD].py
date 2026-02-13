@@ -324,12 +324,8 @@ async def proxy_completion(request: Request, id: str):
 
 if __name__ == "__main__":
     # --- POLÝTICAS DE ROTEAMENTO ---
-    ROUTING_MODE = "kv_limit"     # opções: "kv_limit" | "min_waiting"
+    ROUTING_MODE = "min_waiting"     # opções: "kv_limit" | "min_waiting"
     KV_CACHE_THRESHOLD = 90.0      # só envia se KV < 95%
     STALE_TIMEOUT = 30.0           # tempo limite em segundos para considerar métricas atualizadas
 
     uvicorn.run(app, host="0.0.0.0", port=8080)
-
-
-#TODO:
-# fazer o scheduler enviar as requisicoes de pouco em pouco para os servidores, se nao ele envia demais e sobrecarrega, no intervalo entre medicoes

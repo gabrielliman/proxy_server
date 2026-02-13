@@ -95,3 +95,4 @@ class WorkerPoolDispatcher(BaseDispatcher):
             await queue.put(item)
 
         return await future
+

@@ -23,6 +23,8 @@ class RequestMetrics:
     itl: List[float]          # Inter-token latencies (seconds)
     output_tokens: int
     input_tokens: int
+    start_time: float
+    end_time: float
 
 
 @dataclass
@@ -52,13 +54,56 @@ def _tpot_list(reqs: List[RequestMetrics]) -> List[float]:
 
 
 def summarize_program(prog: ProgramMetrics) -> Dict[str, Any]:
-    ttfts = [r.ttft for r in prog.requests if r.ttft > 0]
-    latencies = [r.latency for r in prog.requests if r.latency > 0]
+    ttfts = [r.ttft for r in prog.requests if r.ttft > 0] #ERRADO
+    latencies = [r.latency for r in prog.requests if r.latency > 0]    #latencia de uma requisicao é o tempo desde que foi enviada para o escalonador ate receber resposta
     itls = [t for r in prog.requests for t in r.itl]
     output_tokens = [r.output_tokens for r in prog.requests]
     input_tokens = [r.input_tokens for r in prog.requests]
+    start = min(r.start_time for r in prog.requests)
+    end = max(r.end_time for r in prog.requests)
+    full_time = float(end - start)
+    total_latency = sum(latencies) #nao conta o tempo entre a resposta de uma requisicao e um envio de outra (provavelmente mt pequeno pq a fila ta sempre cheia)
+    total_output_tokens = sum(output_tokens)
+    total_input_tokens = sum(input_tokens)
+    total_tokens = total_input_tokens + total_output_tokens
 
-    total_latency = sum(latencies)
+    tpots = _tpot_list(prog.requests)
+
+    return {
+        "program_id": prog.program_id,
+        "total_e2el_ms": full_time,
+        "num_requests": len(prog.requests),
+        "total_input_tokens": total_input_tokens,
+        "total_output_tokens": total_output_tokens,
+
+        "request_throughput_rps": safe_div(len(latencies), total_latency),
+        "output_token_throughput": safe_div(total_output_tokens, total_latency),
+        "total_token_throughput": safe_div(total_tokens, total_latency),
+
+        "mean_ttft_ms": float(np.mean(ttfts)) * 1000 if ttfts else None,
+        "median_ttft_ms": float(np.median(ttfts)) * 1000 if ttfts else None,
+        "p99_ttft_ms": percentile(ttfts, 99) * 1000 if ttfts else None,
+
+        "mean_tpot_ms": float(np.mean(tpots)) * 1000 if tpots else None,
+        "median_tpot_ms": float(np.median(tpots)) * 1000 if tpots else None,
+        "p99_tpot_ms": percentile(tpots, 99) * 1000 if tpots else None,
+
+        "mean_itl_ms": float(np.mean(itls)) * 1000 if itls else None,
+        "median_itl_ms": float(np.median(itls)) * 1000 if itls else None,
+        "p99_itl_ms": percentile(itls, 99) * 1000 if itls else None,
+
+        "mean_e2el_ms": float(np.mean(latencies)) * 1000 if latencies else None,
+        "median_e2el_ms": float(np.median(latencies)) * 1000 if latencies else None,
+        "p99_e2el_ms": percentile(latencies, 99) * 1000 if latencies else None,
+    }
+
+def summarize_full(prog: ProgramMetrics) -> Dict[str, Any]:
+    ttfts = [r.ttft for r in prog.requests if r.ttft > 0] #ERRADO
+    latencies = [r.latency for r in prog.requests if r.latency > 0]    #latencia de uma requisicao é o tempo desde que foi enviada para o escalonador ate receber resposta
+    itls = [t for r in prog.requests for t in r.itl]
+    output_tokens = [r.output_tokens for r in prog.requests]
+    input_tokens = [r.input_tokens for r in prog.requests]
+    total_latency = sum(latencies) #nao conta o tempo entre a resposta de uma requisicao e um envio de outra (provavelmente mt pequeno pq a fila ta sempre cheia)
     total_output_tokens = sum(output_tokens)
     total_input_tokens = sum(input_tokens)
     total_tokens = total_input_tokens + total_output_tokens
@@ -91,13 +136,12 @@ def summarize_program(prog: ProgramMetrics) -> Dict[str, Any]:
         "median_e2el_ms": float(np.median(latencies)) * 1000 if latencies else None,
         "p99_e2el_ms": percentile(latencies, 99) * 1000 if latencies else None,
     }
-
-
 # ============================================================
 # HTTP request logic (returns metrics AND output text)
 # ============================================================
 
 from typing import Literal
+
 
 async def send_request(
     session: aiohttp.ClientSession,
@@ -155,7 +199,8 @@ async def send_request(
                 )
 
             result = json.loads(resp_text)
-            latency = time.perf_counter() - start
+            end=time.perf_counter()
+            latency = end - start
 
             # ---------------------------
             # Output parsing
@@ -192,13 +237,15 @@ async def send_request(
                     itl=itl,
                     output_tokens=output_tokens,
                     input_tokens=input_tokens,
+                    start_time=start,
+                    end_time=end
                 ),
                 text,
             )
 
     except Exception as e:
         print(f"[ERROR] Request failed for program {program_id}: {e}")
-        return RequestMetrics(0.0, 0.0, [], 0, 0), ""
+        return RequestMetrics(0.0, 0.0, [], 0, 0, 0.0, 0.0), ""
 
 
 
@@ -216,7 +263,7 @@ async def send_stateful_request(
     model_name,
     tokenizer,
     conversation_state: dict,
-    max_tokens=2048,
+    max_tokens=100,
     temperature=0.0,
 ):
 
@@ -295,7 +342,6 @@ class RateLimiter:
 
 
 
-
 async def run_programs(
     program_requests: List[Tuple[str, List[str]]],
     base_url: str,
@@ -306,62 +352,76 @@ async def run_programs(
     mode: Literal["chat", "completion"],
 ) -> List[ProgramMetrics]:
 
+    # ----------------------------
+    # Concurrency & rate limiting
+    # ----------------------------
     if max_concurrency is None or max_concurrency <= 0:
         semaphore = asyncio.Semaphore(1_000_000_000)
     else:
         semaphore = asyncio.Semaphore(max_concurrency)
+
     rate_limiter = RateLimiter(rps)
+
     total_requests = sum(len(prompts) for _, prompts in program_requests)
 
     async with aiohttp.ClientSession() as session:
+
         async def run_single_program(pid, prompts, pbar):
+            """
+            Executes a single program (chat) SEQUENTIALLY.
+            Preserves full chat semantics.
+            """
+            req_metrics: List[RequestMetrics] = []
+            conversation_state = {}
 
-                req_metrics = []
-                conversation_state = {}
+            for new_message in prompts:
 
-                for new_message in prompts:
-                    # === DEBUG PRINT DO QUE ESTÁ SENDO AO MODELO ===
-                    history = conversation_state.get(pid, [])
+                # ----------------------------
+                # Arrival control (GLOBAL)
+                # ----------------------------
+                await rate_limiter.acquire()
 
-                    if isinstance(history, list):
-                        # chat mode: list of {role, content}
-                        total_chars = sum(len(m.get("content", "")) for m in history)
-                        # print(f"   [History length = {total_chars} chars | {len(history)} messages]")
-                    # else:
-                        # completion mode: plain string
-                        # print(f"   [History length = {len(history)} chars]")
-                    # print(conversation_state)
+                # Arrival timestamp for validation
+                async with REQUEST_SEND_LOCK:
+                    REQUEST_SEND_TIMES.append(time.perf_counter())
 
-                    async with semaphore:
-                        await rate_limiter.acquire()
-                        async with REQUEST_SEND_LOCK:
-                            REQUEST_SEND_TIMES.append(time.perf_counter())
-                        rm = await send_stateful_request(
-                            session=session,
-                            base_url=base_url,
-                            program_id=pid,
-                            new_user_message=new_message,
-                            mode=mode,
-                            model_name=model_name,
-                            tokenizer=tokenizer,
-                            conversation_state=conversation_state,
-                        )
+                # ----------------------------
+                # Execution (SEQUENTIAL per program)
+                # ----------------------------
+                async with semaphore:
+                    rm = await send_stateful_request(
+                        session=session,
+                        base_url=base_url,
+                        program_id=pid,
+                        new_user_message=new_message,
+                        mode=mode,
+                        model_name=model_name,
+                        tokenizer=tokenizer,
+                        conversation_state=conversation_state,
+                    )
 
+                req_metrics.append(rm)
+                pbar.update(1)
 
-                    req_metrics.append(rm)
-                    pbar.update(1)
+            return ProgramMetrics(program_id=pid, requests=req_metrics)
 
-                return ProgramMetrics(program_id=pid, requests=req_metrics)
+        # ----------------------------
+        # Launch programs concurrently
+        # ----------------------------
+        program_tasks = []
 
-
-        tasks = []
         with tqdm(total=total_requests, desc="Completed requests") as pbar:
             for pid, prompts in program_requests:
-                tasks.append(asyncio.create_task(
-                    run_single_program(pid, prompts, pbar)
-                ))
+                program_tasks.append(
+                    asyncio.create_task(run_single_program(pid, prompts, pbar))
+                )
 
-            return await asyncio.gather(*tasks)
+            program_results = await asyncio.gather(*program_tasks)
+
+        return program_results
+
+
+
 
 
 # ============================================================
@@ -377,7 +437,7 @@ async def benchmark_sharegpt(
     rps: float = float("inf"),
     mode: Literal["chat", "completion"] = "completion",
     burstiness: float = 1.0,
-    max_chat_len: int = 2048,
+    chat_len: int = 0,
 ):
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -400,11 +460,12 @@ async def benchmark_sharegpt(
         if user_msgs:
             # print(pid)
             # if(len(user_msgs)==2):
-            if(len(user_msgs)>max_chat_len):
-                user_msgs=user_msgs[:max_chat_len]
-                # print(user_msgs)
+            if(chat_len>0):
+                if(len(user_msgs)>chat_len):
+                    user_msgs=user_msgs[:chat_len]
+                    program_requests.append((pid, user_msgs))
+            else:
                 program_requests.append((pid, user_msgs))
-                # break
 
     num_programs = len(program_requests)
     total_requests = sum(len(msgs) for _, msgs in program_requests)
@@ -428,12 +489,22 @@ async def benchmark_sharegpt(
     # print(f"\nBenchmark wall-clock duration: {total_wall:.2f}s\n")
 
     per_program_metrics = [summarize_program(p) for p in program_results]
-
     all_requests = [r for p in program_results for r in p.requests]
     full_prog = ProgramMetrics("FULL_DATASET", all_requests)
-    full_metrics = summarize_program(full_prog)
+    full_metrics = summarize_full(full_prog)
+    # ---- per-program E2EL aggregation ----
+    e2el_values = np.array(
+        [p["total_e2el_ms"] for p in per_program_metrics if p.get("total_e2el_ms") is not None],
+        dtype=float
+    )
 
-    full_metrics["benchmark_wall_time_s"] = total_wall
+    if e2el_values.size:
+        full_metrics["mean_e2el_per_program"] = float(np.mean(e2el_values))
+        full_metrics["median_e2el_per_program"] = float(np.median(e2el_values))
+        full_metrics["p99_e2el_per_program"] = float(np.percentile(e2el_values, 99))
+
+
+    full_metrics["total_e2el_s"] = total_wall
     full_metrics["num_programs"] = num_programs
     full_metrics["total_requests"] = total_requests
 
@@ -479,7 +550,7 @@ if __name__ == "__main__":
     parser.add_argument("--request-rate", type=float, default=float("inf"))
     parser.add_argument("--burstiness", type=float, default=1.0)
     parser.add_argument("--output-json", type=str, default=None)
-    parser.add_argument("--max_chat_len", type=int, default=2048)
+    parser.add_argument("--chat_len", type=int, default=0)
     parser.add_argument(
     "--mode",
     choices=["chat", "completion"],
@@ -500,7 +571,7 @@ if __name__ == "__main__":
             max_concurrency=args.max_concurrency,
             rps=args.request_rate,
             burstiness=args.burstiness,
-            max_chat_len=args.max_chat_len,
+            chat_len=args.chat_len,
         )
     )
 

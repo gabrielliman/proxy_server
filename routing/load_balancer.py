@@ -194,7 +194,7 @@ class LeastKVCacheStrategy(LoadBalancerStrategy):
 
         return best_engine
 
-
+    
 class AutelixStrategy(LoadBalancerStrategy):
     """
     Autellix-style: short requests -> least-used engine; long requests -> pinned per-program engine.
@@ -423,10 +423,12 @@ class LoadBalancer:
         return AutelixStrategy(LOAD_BALANCER_SHORT_REQUEST_THRESHOLD)
 
 
+      
     async def select_engine(self, program_id: Optional[str], num_input_tokens: int) -> str:
         metrics = self._get_cached_metrics()
         return await self.strategy.select_engine(program_id, num_input_tokens, metrics)
 
+    
     async def on_program_complete(self, program_id: str):
         await self.strategy.on_program_complete(program_id)
 

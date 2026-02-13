@@ -7,11 +7,11 @@ set -e
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate /scratch/global/abacus
 
-BASE_URL="http://localhost:8080"
+BASE_URL="http://localhost:8081"
 DATASET="/scratch/global/datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
 MODEL="Qwen/Qwen3-4B"
-LIMIT=10
-OUTPUTS_DIR="outputs_benchmark_load_balancer_2_engines"
+LIMIT=50
+OUTPUTS_DIR="outputs_benchmark_50_25_Qwen4B"
 
 mkdir -p "$OUTPUTS_DIR"
 
@@ -21,8 +21,14 @@ mkdir -p "$OUTPUTS_DIR"
 # ============================================================
 RESET_URLS=(
   "http://localhost:8105/reset_prefix_cache"
-  "http://localhost:8106/reset_prefix_cache"
+#   "http://localhost:8106/reset_prefix_cache"
 )
+
+PREFIX_URL=(
+  "http://localhost:8105/metrics"
+#   "http://localhost:8106/metrics"
+)
+
 
 # ============================================================
 # Experiment grid
@@ -35,12 +41,46 @@ LOAD_BALANCER_STRATEGIES=(
 #   "least-total-load"
   "least-waiting"
 #   "least-kv-cache"
-  "autellix"
+#   "autellix"
 #   "kv-cache"
-  "kv-threshold-autellix"
+  # "kv-threshold-autellix"
 ) 
-RATES=("0.25" "0.5" "0.75" "1.0" "1.25" "1.5" "2.0")
-# RATES=("0.2" "0.4" "0.6" "0.8" "1.0" "1.3" "1.6" "2.0" "3.0" "5.0")
+# RATES=("8" "16" "32")
+RATES=("1" "4" "8" "16" "32")
+
+# ============================================================
+# Helper: scrape per-engine metrics
+# ============================================================
+
+get_prefix_metrics_per_engine() {
+    local url=$1
+
+    curl -s "$url" | awk '
+
+    /^vllm:prefix_cache_queries_total{/ {
+        match($0, /engine="([^"]+)"/, m)
+        match($0, /} ([0-9.e+-]+)/, v)
+        queries[m[1]] = v[1]
+    }
+
+    /^vllm:prefix_cache_hits_total{/ {
+        match($0, /engine="([^"]+)"/, m)
+        match($0, /} ([0-9.e+-]+)/, v)
+        hits[m[1]] = v[1]
+    }
+
+    END {
+        for (e in queries) {
+            q = queries[e] + 0
+            h = (e in hits ? hits[e] : 0) + 0
+
+            # MACHINE READABLE (important!)
+            printf "%s %f %f\n", e, q, h
+        }
+    }'
+}
+
+
 
 # ============================================================
 # MAIN LOOP
@@ -74,6 +114,22 @@ for rate in "${RATES[@]}"; do
 
         echo "Run $RUN / $REPEATS"
 
+        for url in "${RESET_URLS[@]}"; do
+          curl -s -X POST "$url" > /dev/null
+        done
+        sleep 2
+
+        unset before_q before_h prefix_json_map
+        declare -A before_q
+        declare -A before_h
+
+        for url in "${PREFIX_URL[@]}"; do
+            while read -r engine q h; do
+                before_q[$engine]=$q
+                before_h[$engine]=$h
+            done < <(get_prefix_metrics_per_engine "$url")
+        done
+        OUTPUT_JSON="${OUTPUTS_DIR}/output_${scheduler}_${strategy}_rate${rate}_run${RUN}.json"
         python benchmark_stateful.py \
             --base-url "$BASE_URL" \
             --dataset "$DATASET" \
@@ -81,32 +137,83 @@ for rate in "${RATES[@]}"; do
             --limit "$LIMIT" \
             --request-rate "$rate" \
             --mode "chat" \
-            --max_chat_len "25" \
-            --output-json "${OUTPUTS_DIR}/output_${scheduler}_${strategy}_rate${rate}_run${RUN}.json"
+            --output-json "$OUTPUT_JSON" \
+            --chat_len 25
 
-        # -------------------------------
-        # Reset prefix cache (all engines)
-        # -------------------------------
-        for url in "${RESET_URLS[@]}"; do
-            curl -s -X POST "$url" > /dev/null
+        echo "Stopping proxy (PID=$PROXY_PID)"
+        kill "$PROXY_PID"
+        wait "$PROXY_PID" 2>/dev/null || true
+        sleep 5
+
+        # ------------------------------------
+        # AFTER metrics + compute delta
+        # ------------------------------------
+        declare -A prefix_json_map
+
+        for url in "${PREFIX_URL[@]}"; do
+            while read engine q h; do
+
+                before_queries=${before_q[$engine]:-0}
+                before_hits=${before_h[$engine]:-0}
+
+                dq=$(echo "$q - $before_queries" | bc)
+                dh=$(echo "$h - $before_hits" | bc)
+
+                hr=$(awk -v dh="$dh" -v dq="$dq" 'BEGIN { if (dq>0) printf "%.6f", dh/dq; else print 0 }')
+
+                prefix_json_map[$engine]="{\"queries\":$dq,\"hits\":$dh,\"hit_rate\":$hr}"
+            done < <(get_prefix_metrics_per_engine "$url")
         done
 
-        echo "Prefix cache reset done"
+        # ------------------------------------
+        # Build JSON object
+        # ------------------------------------
+        prefix_json="{"
+        first=1
+
+        for engine in "${!prefix_json_map[@]}"; do
+            if [ $first -eq 0 ]; then
+                prefix_json+=","
+            fi
+
+            prefix_json+="\"engine_${engine}\":${prefix_json_map[$engine]}"
+            first=0
+        done
+
+        prefix_json+="}"
+
+        # ------------------------------------
+        # Inject into benchmark JSON
+        # ------------------------------------
+        tmp=$(mktemp)
+
+        jq \
+        --argjson prefix "$prefix_json" \
+        --arg scheduler "$scheduler" \
+        --arg strategy "$strategy" \
+        --arg rate "$rate" \
+        --arg num_conversations "$LIMIT" \
+        '
+        .full_metrics.prefix_cache = $prefix
+        | .full_metrics.scheduler = $scheduler
+        | .full_metrics.load_balancer = $strategy
+        | .full_metrics.request_rate = ($rate | tonumber)
+        | .full_metrics.num_conversations = ($num_conversations | tonumber)
+        ' "$OUTPUT_JSON" > "$tmp" && mv "$tmp" "$OUTPUT_JSON"
+
+        echo "Metrics injected into JSON"
         echo "--------------------------------------"
+        
 
     done
 
     # ------------------------------------
     # Stop proxy server
     # ------------------------------------
-    echo "Stopping proxy (PID=$PROXY_PID)"
-    kill "$PROXY_PID"
-    wait "$PROXY_PID" 2>/dev/null || true
-    sleep 5
-
 done
 done
 done
+mv /scratch/global/proxy_server/kv_cache_usage.csv "$OUTPUTS_DIR/kv_cache_usage.csv"
 
 echo "======================================"
 echo "All benchmarks completed successfully."
