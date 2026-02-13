@@ -11,7 +11,7 @@ BASE_URL="http://localhost:8081"
 DATASET="/scratch/global/datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
 MODEL="Qwen/Qwen3-4B"
 LIMIT=50
-OUTPUTS_DIR="outputs_benchmark_50_25_Qwen4B"
+OUTPUTS_DIR="teste" #"outputs_benchmark_50_25_Qwen4B"
 
 mkdir -p "$OUTPUTS_DIR"
 
@@ -39,13 +39,14 @@ SCHEDULERS=("fcfs" "plas")
 LOAD_BALANCER_STRATEGIES=(
   "round-robin"
 #   "least-total-load"
-  "least-waiting"
+#   "least-waiting"
 #   "least-kv-cache"
 #   "autellix"
 #   "kv-cache"
   # "kv-threshold-autellix"
 ) 
 # RATES=("8" "16" "32")
+# RATES=("50")
 RATES=("1" "4" "8" "16" "32")
 
 # ============================================================
