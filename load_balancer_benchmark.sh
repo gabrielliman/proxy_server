@@ -9,9 +9,12 @@ conda activate /scratch/global/abacus
 
 BASE_URL="http://localhost:8081"
 DATASET="/scratch/global/datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
-MODEL="Qwen/Qwen3-4B"
+
+
+
+MODEL="meta-llama/Llama-3.1-8B-Instruct"
 LIMIT=50
-OUTPUTS_DIR="teste" #"outputs_benchmark_50_25_Qwen4B"
+OUTPUTS_DIR="outputs_benchmark_50_25_LLama_2GPU"
 
 mkdir -p "$OUTPUTS_DIR"
 
@@ -21,33 +24,33 @@ mkdir -p "$OUTPUTS_DIR"
 # ============================================================
 RESET_URLS=(
   "http://localhost:8105/reset_prefix_cache"
-#   "http://localhost:8106/reset_prefix_cache"
+  "http://localhost:8106/reset_prefix_cache"
 )
 
 PREFIX_URL=(
   "http://localhost:8105/metrics"
-#   "http://localhost:8106/metrics"
+  "http://localhost:8106/metrics"
 )
 
 
 # ============================================================
 # Experiment grid
 # ============================================================
-REPEATS=1
+REPEATS=5
 
 SCHEDULERS=("fcfs" "plas") 
 LOAD_BALANCER_STRATEGIES=(
   "round-robin"
-#   "least-total-load"
+  "least-total-load"
 #   "least-waiting"
 #   "least-kv-cache"
-#   "autellix"
+  "autellix"
 #   "kv-cache"
-  # "kv-threshold-autellix"
+  "kv-threshold-autellix"
 ) 
 # RATES=("8" "16" "32")
 # RATES=("50")
-RATES=("1" "4" "8" "16" "32")
+RATES=("1" "4" "8" "16" "32" )
 
 # ============================================================
 # Helper: scrape per-engine metrics
@@ -88,8 +91,15 @@ get_prefix_metrics_per_engine() {
 # ============================================================
 
 for scheduler in "${SCHEDULERS[@]}"; do
-for strategy in "${LOAD_BALANCER_STRATEGIES[@]}"; do
 for rate in "${RATES[@]}"; do
+
+#INICIA PROXY
+#RODAR BASELINE
+#MATA PROXY
+#PARSER DAS INFORMACOES DO JSON E TER COMO VARIAVEL NO SCRIPT
+
+for strategy in "${LOAD_BALANCER_STRATEGIES[@]}"; do
+
 
     echo "======================================"
     echo "Starting proxy:"
@@ -139,7 +149,8 @@ for rate in "${RATES[@]}"; do
             --request-rate "$rate" \
             --mode "chat" \
             --output-json "$OUTPUT_JSON" \
-            --chat_len 25
+            --chat_len 25 \
+            # PASSAR AS NOVAS VARIAVEIS EXTRAIDAS
 
         echo "Stopping proxy (PID=$PROXY_PID)"
         kill "$PROXY_PID"

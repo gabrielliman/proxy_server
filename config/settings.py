@@ -1,17 +1,23 @@
 import os
-
+#CONFIGURE AQUI
 MODEL_ROUTES = {
-    "Qwen/Qwen3-4B": [
-        "http://localhost:8105",
-        # "http://localhost:8105"
-    ],
-    
-    # "meta-llama/Llama-3.1-8B-Instruct": [
-    #     "http://localhost:8106"
+    # "Qwen/Qwen3-4B": [
+    #     "http://localhost:8105",
+    #     # "http://localhost:8105"
     # ],
+    
+    "meta-llama/Llama-3.1-8B-Instruct": [
+        "http://localhost:8105",
+        "http://localhost:8106"
+    ],
 }
 
-
+#nao funciona para o endpoint completions
+BACKEND_PARALLELISM = {
+    "http://localhost:8105": 15, #50% a mais que o paralelismo real
+    "http://localhost:8106": 15,
+}
+#FIM
 ALL_BACKENDS = sorted({url for lst in MODEL_ROUTES.values() for url in lst})
 
 BACKEND_METRICS = {
@@ -28,11 +34,6 @@ METRICS_TIMEOUT = 1.5
 
 DISPATCH_MODE = "worker_pool"  # "direct", "worker_pool", "semaphore"
 
-#nao funciona para o endpoint completions
-BACKEND_PARALLELISM = {
-    "http://localhost:8105": 15, #50% a mais que o paralelismo real
-    # "http://localhost:8106": 15,
-}
  
 # Process table pruning (seconds)
 PROCESS_TABLE_PRUNE_TTL = 600  # default 10 minutes

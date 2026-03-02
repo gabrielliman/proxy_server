@@ -99,7 +99,7 @@ def summarize_program(prog: ProgramMetrics) -> Dict[str, Any]:
 
 def summarize_full(prog: ProgramMetrics) -> Dict[str, Any]:
     ttfts = [r.ttft for r in prog.requests if r.ttft > 0] #ERRADO
-    latencies = [r.latency for r in prog.requests if r.latency > 0]    #latencia de uma requisicao é o tempo desde que foi enviada para o escalonador ate receber resposta
+    latencies = [r.latency for r in prog.requests if r.latency > 0]   #latencia de uma requisicao é o tempo desde que foi enviada para o escalonador ate receber resposta
     itls = [t for r in prog.requests for t in r.itl]
     output_tokens = [r.output_tokens for r in prog.requests]
     input_tokens = [r.input_tokens for r in prog.requests]
@@ -107,7 +107,10 @@ def summarize_full(prog: ProgramMetrics) -> Dict[str, Any]:
     total_output_tokens = sum(output_tokens)
     total_input_tokens = sum(input_tokens)
     total_tokens = total_input_tokens + total_output_tokens
-
+    # criar lista de requisicoes validas para cada threshold
+    # comparar com os thresholds quais requisições são "validas"
+    # calcular req_goodput, token_throghput considerando apenas as requisições validas, e2el p50,p75.p90,p95,p99
+    
     tpots = _tpot_list(prog.requests)
 
     return {
@@ -122,19 +125,24 @@ def summarize_full(prog: ProgramMetrics) -> Dict[str, Any]:
 
         "mean_ttft_ms": float(np.mean(ttfts)) * 1000 if ttfts else None,
         "median_ttft_ms": float(np.median(ttfts)) * 1000 if ttfts else None,
+        "p90_ttft_ms": percentile(ttfts, 90) * 1000 if ttfts else None,
         "p99_ttft_ms": percentile(ttfts, 99) * 1000 if ttfts else None,
 
         "mean_tpot_ms": float(np.mean(tpots)) * 1000 if tpots else None,
         "median_tpot_ms": float(np.median(tpots)) * 1000 if tpots else None,
+        "p90_tpot_ms": percentile(tpots, 90) * 1000 if tpots else None,
         "p99_tpot_ms": percentile(tpots, 99) * 1000 if tpots else None,
 
         "mean_itl_ms": float(np.mean(itls)) * 1000 if itls else None,
         "median_itl_ms": float(np.median(itls)) * 1000 if itls else None,
+        "p90_itl_ms": percentile(itls, 90) * 1000 if itls else None,
         "p99_itl_ms": percentile(itls, 99) * 1000 if itls else None,
 
         "mean_e2el_ms": float(np.mean(latencies)) * 1000 if latencies else None,
         "median_e2el_ms": float(np.median(latencies)) * 1000 if latencies else None,
+        "p90_e2el_ms": percentile(latencies, 90) * 1000 if latencies else None,
         "p99_e2el_ms": percentile(latencies, 99) * 1000 if latencies else None,
+
     }
 # ============================================================
 # HTTP request logic (returns metrics AND output text)
@@ -460,8 +468,8 @@ async def benchmark_sharegpt(
         if user_msgs:
             # print(pid)
             # if(len(user_msgs)==2):
-            if(chat_len>0):
-                if(len(user_msgs)>chat_len):
+            if(chat_len>=0):
+                if(len(user_msgs)>=chat_len):
                     user_msgs=user_msgs[:chat_len]
                     program_requests.append((pid, user_msgs))
             else:
