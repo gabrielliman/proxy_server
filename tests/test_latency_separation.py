@@ -5,7 +5,10 @@ Run without needing to start benchmark servers.
 """
 
 import sys
+import os
 import numpy as np
+
+sys.path.append(os.path.abspath(".."))
 from benchmark_stateful import (
     RequestMetrics,
     ProgramMetrics,
