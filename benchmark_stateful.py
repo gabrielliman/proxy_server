@@ -97,6 +97,126 @@ def summarize_program(prog: ProgramMetrics) -> Dict[str, Any]:
         "p99_e2el_ms": percentile(latencies, 99) * 1000 if latencies else None,
     }
 
+
+def calculate_percentile_thresholds(
+    requests: List[RequestMetrics],
+    percentiles: List[int] = [50, 75, 90, 95, 99]
+) -> Dict[int, float]:
+ 
+    latencies = [r.latency for r in requests if r.latency > 0]
+    
+    if not latencies:
+        return {p: 0.0 for p in percentiles}
+    
+    thresholds = {}
+    for p in percentiles:
+        threshold = percentile(latencies, p)
+        thresholds[p] = threshold if threshold is not None else 0.0
+    
+    return thresholds
+
+
+def separate_requests_by_latency(
+    program: ProgramMetrics,
+    percentiles: List[int] = [50, 75, 90, 95, 99]
+) -> Dict[str, Any]:
+    
+    if not program.requests:
+        return {
+            "thresholds": {},
+            "percentile_buckets": {},
+            "metrics_per_percentile": {}
+        }
+    
+    thresholds = calculate_percentile_thresholds(program.requests, percentiles)
+    
+    percentile_buckets = {}
+    for p in sorted(percentiles):
+        threshold = thresholds[p]
+        valid_requests = [r for r in program.requests if r.latency <= threshold]
+        percentile_buckets[p] = valid_requests
+    
+    metrics_per_percentile = {}
+    for p in sorted(percentiles):
+        threshold = thresholds[p]
+        valid_requests = percentile_buckets[p]
+        
+        if valid_requests:
+            valid_latencies = [r.latency for r in valid_requests if r.latency > 0]
+            valid_ttfts = [r.ttft for r in valid_requests if r.ttft > 0]
+            valid_output_tokens = [r.output_tokens for r in valid_requests]
+            valid_input_tokens = [r.input_tokens for r in valid_requests]
+            valid_itls = [t for r in valid_requests for t in r.itl]
+            valid_tpots = _tpot_list(valid_requests)
+            
+            total_latency = sum(valid_latencies)
+            total_output_tokens = sum(valid_output_tokens)
+            total_input_tokens = sum(valid_input_tokens)
+            total_tokens = total_input_tokens + total_output_tokens
+            
+            metrics_per_percentile[p] = {
+                "p": p,
+                "threshold_ms": threshold * 1000,
+                "num_valid_requests": len(valid_requests),
+                "valid_request_percentage": (len(valid_requests) / len(program.requests) * 100) if program.requests else 0,
+                
+                "request_goodput_rps": safe_div(len(valid_requests), total_latency),
+                "output_token_goodput": safe_div(total_output_tokens, total_latency),
+                "total_token_goodput": safe_div(total_tokens, total_latency),
+                
+                "total_input_tokens": total_input_tokens,
+                "total_output_tokens": total_output_tokens,
+                
+                "mean_e2el_ms": float(np.mean(valid_latencies)) * 1000 if valid_latencies else None,
+                "median_e2el_ms": float(np.median(valid_latencies)) * 1000 if valid_latencies else None,
+                "p95_e2el_ms": percentile(valid_latencies, 95) * 1000 if valid_latencies else None,
+                "p99_e2el_ms": percentile(valid_latencies, 99) * 1000 if valid_latencies else None,
+                
+                "mean_ttft_ms": float(np.mean(valid_ttfts)) * 1000 if valid_ttfts else None,
+                "median_ttft_ms": float(np.median(valid_ttfts)) * 1000 if valid_ttfts else None,
+                "p99_ttft_ms": percentile(valid_ttfts, 99) * 1000 if valid_ttfts else None,
+                
+                "mean_tpot_ms": float(np.mean(valid_tpots)) * 1000 if valid_tpots else None,
+                "median_tpot_ms": float(np.median(valid_tpots)) * 1000 if valid_tpots else None,
+                "p99_tpot_ms": percentile(valid_tpots, 99) * 1000 if valid_tpots else None,
+                
+                "mean_itl_ms": float(np.mean(valid_itls)) * 1000 if valid_itls else None,
+                "median_itl_ms": float(np.median(valid_itls)) * 1000 if valid_itls else None,
+                "p99_itl_ms": percentile(valid_itls, 99) * 1000 if valid_itls else None,
+            }
+        else:
+            metrics_per_percentile[p] = {
+                "p": p,
+                "threshold_ms": threshold * 1000,
+                "num_valid_requests": 0,
+                "valid_request_percentage": 0,
+                "request_goodput_rps": None,
+                "output_token_goodput": None,
+                "total_token_goodput": None,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0,
+            }
+    
+    return {
+        "program_id": program.program_id,
+        "thresholds": thresholds,
+        "percentile_buckets": percentile_buckets,
+        "metrics_per_percentile": metrics_per_percentile
+    }
+
+
+def separate_all_programs_by_latency(
+    program_results: List[ProgramMetrics],
+    percentiles: List[int] = [50, 75, 90, 95, 99]
+) -> Dict[str, Any]:
+
+    results = {}
+    for program in program_results:
+        results[program.program_id] = separate_requests_by_latency(program, percentiles)
+    
+    return results
+
+
 def summarize_full(prog: ProgramMetrics) -> Dict[str, Any]:
     ttfts = [r.ttft for r in prog.requests if r.ttft > 0] #ERRADO
     latencies = [r.latency for r in prog.requests if r.latency > 0]   #latencia de uma requisicao é o tempo desde que foi enviada para o escalonador ate receber resposta
@@ -107,9 +227,6 @@ def summarize_full(prog: ProgramMetrics) -> Dict[str, Any]:
     total_output_tokens = sum(output_tokens)
     total_input_tokens = sum(input_tokens)
     total_tokens = total_input_tokens + total_output_tokens
-    # criar lista de requisicoes validas para cada threshold
-    # comparar com os thresholds quais requisições são "validas"
-    # calcular req_goodput, token_throghput considerando apenas as requisições validas, e2el p50,p75.p90,p95,p99
     
     tpots = _tpot_list(prog.requests)
 
@@ -497,9 +614,21 @@ async def benchmark_sharegpt(
     # print(f"\nBenchmark wall-clock duration: {total_wall:.2f}s\n")
 
     per_program_metrics = [summarize_program(p) for p in program_results]
+    
+    latency_separation = separate_all_programs_by_latency(
+        program_results,
+        percentiles=[50, 75, 90, 95, 99]
+    )
+    
     all_requests = [r for p in program_results for r in p.requests]
     full_prog = ProgramMetrics("FULL_DATASET", all_requests)
     full_metrics = summarize_full(full_prog)
+    
+    full_latency_separation = separate_requests_by_latency(
+        full_prog,
+        percentiles=[50, 75, 90, 95, 99]
+    )
+    
     # ---- per-program E2EL aggregation ----
     e2el_values = np.array(
         [p["total_e2el_ms"] for p in per_program_metrics if p.get("total_e2el_ms") is not None],
@@ -537,8 +666,30 @@ async def benchmark_sharegpt(
     rate_stats = analyze_request_rate(REQUEST_SEND_TIMES)
     full_metrics["rate_limiter_validation"] = rate_stats
 
+    return per_program_metrics, full_metrics, latency_separation, full_latency_separation
 
-    return per_program_metrics, full_metrics
+def get_baseline_metrics(baseline_path,request_rate):
+    base_dir = "/scratch/global/proxy_server/" + baseline_path
+    rate = "_rate" + str(int(request_rate))
+    files = [f for f in os.listdir(base_dir) if f.endswith('.json') and rate in f]
+    median_e2el_ms = 0
+    p90_e2el_ms = 0
+    p99_e2el_ms = 0
+    count = len(files)
+
+    for filename in files:
+        full_path = os.path.join(base_dir, filename)
+        with open(full_path, 'r') as file:
+            data = json.load(file)
+            median_e2el_ms += data["full_metrics"]["median_e2el_ms"]
+            p90_e2el_ms += data["full_metrics"]["p90_e2el_ms"]
+            p99_e2el_ms += data["full_metrics"]["p99_e2el_ms"]
+    
+    median_e2el_ms = median_e2el_ms/count
+    p90_e2el_ms = p90_e2el_ms/count
+    p99_e2el_ms = p99_e2el_ms/count
+
+    return median_e2el_ms, p90_e2el_ms, p99_e2el_ms
 
 
 # ============================================================
@@ -564,12 +715,16 @@ if __name__ == "__main__":
     choices=["chat", "completion"],
     default="chat",
     help="Which OpenAI-style API to use",
-)
-
-
+    )
+    parser.add_argument("--baseline_path",default="outputs_baseline")
+    parser.add_argument("--is_baseline_run",default=0)
     args = parser.parse_args()
 
-    per_program, full_metrics = asyncio.run(
+    # baseline metrics
+    if args.is_baseline_run == "0":
+        median_e2el_ms, p90_e2el_ms, p99_e2el_ms = get_baseline_metrics(args.baseline_path,args.request_rate)
+
+    per_program, full_metrics, latency_separation, full_latency_separation = asyncio.run(
         benchmark_sharegpt(
             dataset_path=args.dataset,
             base_url=args.base_url,
@@ -586,6 +741,16 @@ if __name__ == "__main__":
     print("======== FULL DATASET METRICS ========")
     for k, v in full_metrics.items():
         print(f"{k}: {v}")
+
+    print("\n======== LATENCY PERCENTILE SEPARATION (FULL DATASET) ========")
+    for p in sorted(full_latency_separation["metrics_per_percentile"].keys()):
+        metrics = full_latency_separation["metrics_per_percentile"][p]
+        print(f"\nPercentile P{p}:")
+        print(f"  Threshold: {metrics['threshold_ms']:.2f}ms")
+        print(f"  Valid Requests: {metrics['num_valid_requests']} ({metrics['valid_request_percentage']:.1f}%)")
+        print(f"  Request Goodput: {metrics['request_goodput_rps']:.2f} rps" if metrics['request_goodput_rps'] else "  Request Goodput: N/A")
+        print(f"  Token Goodput: {metrics['output_token_goodput']:.2f} tps" if metrics['output_token_goodput'] else "  Token Goodput: N/A")
+        print(f"  E2EL - Median: {metrics['median_e2el_ms']:.2f}ms, P99: {metrics['p99_e2el_ms']:.2f}ms" if metrics['median_e2el_ms'] else "  E2EL: N/A")
 
     print("\n======== TOP 10 PROGRAMS BY NUM_REQUESTS ========")
     top_programs = sorted(
@@ -604,7 +769,26 @@ if __name__ == "__main__":
     if args.output_json:
         out_path = args.output_json
         os.makedirs(os.path.dirname(out_path), exist_ok=True) if os.path.dirname(out_path) else None
-        to_save = {"full_metrics": full_metrics, "per_program": per_program}
+        
+        latency_sep_output = {}
+        for prog_id, sep_data in latency_separation.items():
+            latency_sep_output[prog_id] = {
+                "thresholds": sep_data["thresholds"],
+                "metrics_per_percentile": sep_data["metrics_per_percentile"],
+                "num_percentiles": len(sep_data["metrics_per_percentile"])
+            }
+        
+        full_latency_sep_output = {
+            "thresholds": full_latency_separation["thresholds"],
+            "metrics_per_percentile": full_latency_separation["metrics_per_percentile"],
+        }
+        
+        to_save = {
+            "full_metrics": full_metrics,
+            "per_program": per_program,
+            "latency_separation": latency_sep_output,
+            "full_latency_separation": full_latency_sep_output
+        }
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(to_save, f, indent=2)
         print(f"\nSaved metrics JSON to: {out_path}")
