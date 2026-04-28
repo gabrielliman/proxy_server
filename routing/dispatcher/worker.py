@@ -5,12 +5,13 @@ import httpx
 import time
 from routing.dispatcher.base import BaseDispatcher
 from routing.queue_manager import get_queue, put_request, get_request
-from config.settings import REQUEST_TIMEOUT, BACKEND_PARALLELISM, ALL_BACKENDS, SCHEDULER
+from config.settings import REQUEST_TIMEOUT, BACKEND_PARALLELISM, ALL_BACKENDS, SCHEDULER,MODEL
 from routing.scheduler_plas import compute_priority
-
+from utils.tokenizer_utils import get_tokenizer
 
 class WorkerPoolDispatcher(BaseDispatcher):
     workers_started = False
+
 
     async def start_workers(self):
         if WorkerPoolDispatcher.workers_started:
@@ -49,13 +50,23 @@ class WorkerPoolDispatcher(BaseDispatcher):
                 try:
                     # mark start (waiting -> running)
                     start = time.time()
+                    output_tokens = None
                     if pid and cid:
                         PROCESS_TABLE.record_call_start(pid, cid, engine_id=backend, start_time=start)
 
                     resp = await client.post(f"{backend}/v1/chat/completions", json=data)
+                    resp_json = resp.json()
+                    
+                    # Extract output tokens from response
+                    if resp_json and "choices" in resp_json:
+                        choice = resp_json["choices"][0] if resp_json["choices"] else {}
+                        text = choice.get("message", {}).get("content", "") or choice.get("text", "")
+                        if text:
+                            tok = get_tokenizer()
+                            output_tokens = len(tok.encode(text, add_special_tokens=False))
 
                     if not future.done():
-                        future.set_result(resp.json())
+                        future.set_result(resp_json)
 
                 except Exception as e:
                     print(f"[WORKER ERROR] {e}")
@@ -66,7 +77,7 @@ class WorkerPoolDispatcher(BaseDispatcher):
                     # completion
                     end = time.time()
                     if pid and cid:
-                        PROCESS_TABLE.record_call_completion(pid, cid, completion_time=end)
+                        PROCESS_TABLE.record_call_completion(pid, cid, completion_time=end, output_tokens=output_tokens)
                     # call task_done if supported (asyncio.Queue)
                     if hasattr(queue, "task_done") and not SCHEDULER == "plas":
                         queue.task_done()

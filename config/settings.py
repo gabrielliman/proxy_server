@@ -1,5 +1,6 @@
 import os
 #CONFIGURE AQUI
+MODEL= "meta-llama/Llama-3.1-8B-Instruct"
 MODEL_ROUTES = {
     # "Qwen/Qwen3-4B": [
     #     "http://localhost:8105",
@@ -8,7 +9,7 @@ MODEL_ROUTES = {
     
     "meta-llama/Llama-3.1-8B-Instruct": [
         "http://localhost:8105",
-        "http://localhost:8106"
+        # "http://localhost:8106"
     ],
 }
 
@@ -44,6 +45,11 @@ SCHEDULER = os.getenv("SCHEDULER", "plas")
 PLAS_EWMA_ALPHA = 0.3
 PLAS_AGE_WEIGHT = 0.5
 PLAS_PRIORITY_BASE = 1.0
+
+# PLAS metric type: 'service_ewma' (default, LAS) or 'kv_token_time'
+# - service_ewma: Uses EWMA of actual service time (Least Attained Service)
+# - kv_token_time: Uses EWMA of KV token-time (d*c = pd + d²/2)
+PLAS_METRIC_TYPE = os.getenv("PLAS_METRIC_TYPE", "kv_token_time")
 
 # Discretized priority queues for PLAS (Autellix-style)
 DISCRETIZED_PRIORITY_BUCKETS = 10  # K: number of priority levels

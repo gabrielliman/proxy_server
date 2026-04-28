@@ -7,6 +7,7 @@ from uuid import uuid4
 from config.settings import (
     MODEL_ROUTES,
     DISPATCH_MODE,
+    MODEL,
 )
 
 from routing.load_balancer import LOAD_BALANCER
@@ -19,6 +20,14 @@ init_queues()
 
 # Lazy dispatcher initialization
 dispatcher = None
+
+from utils.tokenizer_utils import get_tokenizer
+
+
+def count_tokens(text: str) -> int:
+    """Count tokens in text using tokenizer."""
+    tok = get_tokenizer()
+    return len(tok.encode(text, add_special_tokens=False))
 
 router = APIRouter()
 
@@ -60,12 +69,12 @@ async def chat_completion(program_id: str, request: Request):
         raise HTTPException(400, f"Unknown model: {model}")
 
     # -----------------------------
-    # Estimate input tokens (cheap heuristic)
+    # Estimate input tokens (using tokenizer for accurate count)
     # -----------------------------
     messages = data.get("messages", [])
-    num_input_tokens = sum(
-        len(m.get("content", "")) for m in messages if isinstance(m, dict)
-    )
+    # Combine all message content for token counting
+    input_text = "\n".join(m.get("content", "") for m in messages if isinstance(m, dict))
+    num_input_tokens = count_tokens(input_text)
 
     # -----------------------------
     # Select engine via Autellix LB
@@ -80,10 +89,10 @@ async def chat_completion(program_id: str, request: Request):
             await asyncio.sleep(0.05)
 
     # -----------------------------
-    # Instrument arrival
+    # Instrument arrival (with prefill tokens for KV metric)
     # -----------------------------
     call_id = str(uuid4())
-    PROCESS_TABLE.record_call_arrival(program_id, call_id)
+    PROCESS_TABLE.record_call_arrival(program_id, call_id, prefill_tokens=num_input_tokens)
 
     # -----------------------------
     # Dispatch

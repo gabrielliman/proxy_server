@@ -3,11 +3,10 @@ set -e
 
 export HF_HOME="/scratch/global/huggingface_cache/huggingface"
 
-
 # Paths and ports
 MODEL1_NAME="meta-llama/Llama-3.1-8B-Instruct"
 MODEL2_NAME="meta-llama/Llama-3.1-8B-Instruct"
-# MODEL2_NAME="Qwen/Qwen3-4B"
+# MODEL3_NAME="meta-llama/Llama-3.1-8B-Instruct"
 # "meta-llama/Llama-3.1-8B-Instruct"
 # "Qwen/Qwen2.5-1.5B-Instruct"
 # "Qwen/Qwen2.5-0.5B-Instruct"
@@ -17,7 +16,7 @@ MODEL2_NAME="meta-llama/Llama-3.1-8B-Instruct"
 EMBEDDING_PORT=8001
 MODEL1_PORT=8105
 MODEL2_PORT=8106
-# MODEL3_PORT=8007
+#MODEL3_PORT=8007
 
 
 MODEL1_MAX_NUM_SEQS=10
@@ -49,13 +48,13 @@ export VLLM_SERVER_DEV_MODE=1
 
 echo "[INFO] Starting vLLM inference servers"
 
-CUDA_VISIBLE_DEVICES=1 python -m vllm.entrypoints.openai.api_server --model "$MODEL1_NAME" --port $MODEL1_PORT --max-num-seqs $MODEL1_MAX_NUM_SEQS --dtype bfloat16 --max-model-len 40000 --gpu-memory-utilization 0.9  2>&1 | tee "$LOG_DIR/saida_VLLM_$MODEL1_PORT.txt" &
+CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.openai.api_server --model "$MODEL1_NAME" --port $MODEL1_PORT --max-num-seqs $MODEL1_MAX_NUM_SEQS --dtype bfloat16 --max-model-len 40000 --gpu-memory-utilization 0.9  2>&1 | tee "$LOG_DIR/saida_VLLM_$MODEL1_PORT.txt" &
 PID1=$!
 wait_for_ready $MODEL1_PORT
 
-CUDA_VISIBLE_DEVICES=0 python -u -m vllm.entrypoints.openai.api_server --model "$MODEL2_NAME" --port $MODEL2_PORT --max-num-seqs $MODEL2_MAX_NUM_SEQS --dtype bfloat16 --max-model-len 40000 --gpu-memory-utilization 0.9 2>&1 | tee "$LOG_DIR/saida_VLLM_$MODEL2_PORT.txt" &
-PID2=$!
-wait_for_ready $MODEL2_PORT
+# CUDA_VISIBLE_DEVICES=0 python -u -m vllm.entrypoints.openai.api_server --model "$MODEL2_NAME" --port $MODEL2_PORT --max-num-seqs $MODEL2_MAX_NUM_SEQS --dtype bfloat16 --max-model-len 40000 --gpu-memory-utilization 0.9 2>&1 | tee "$LOG_DIR/saida_VLLM_$MODEL2_PORT.txt" &
+# PID2=$!
+# wait_for_ready $MODEL2_PORT
 
 
 

@@ -1,5 +1,5 @@
 # routes/completions.py
-
+#ACHO QUE NAO TA FUNCIONANDO COM O KVTOKENCACHE, NAO SEI SE MEDE OUTPUT TOKEN
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import StreamingResponse
 import httpx
@@ -10,6 +10,14 @@ from config.settings import MODEL_ROUTES, REQUEST_TIMEOUT
 from routing.load_balancer import LOAD_BALANCER
 from routing.process_table import PROCESS_TABLE
 from request_queue.manager import acquire_backend, release_backend
+
+from utils.tokenizer_utils import get_tokenizer
+
+
+def count_tokens(text: str) -> int:
+    """Count tokens in text using tokenizer."""
+    tok = get_tokenizer()
+    return len(tok.encode(text, add_special_tokens=False))
 
 router = APIRouter()
 
@@ -30,7 +38,7 @@ async def completions(program_id: str, request: Request):
     # Estimate input tokens (cheap heuristic)
     # -----------------------------
     prompt = body.get("prompt", "")
-    num_input_tokens = len(prompt) if isinstance(prompt, str) else 0
+    num_input_tokens = count_tokens(prompt)
 
     # -----------------------------
     # Select engine via Autellix LB
@@ -48,7 +56,7 @@ async def completions(program_id: str, request: Request):
     # Instrument arrival
     # -----------------------------
     call_id = str(uuid4())
-    PROCESS_TABLE.record_call_arrival(program_id, call_id)
+    PROCESS_TABLE.record_call_arrival(program_id, call_id, prefill_tokens=num_input_tokens)
 
     # -----------------------------
     # Backend concurrency control
@@ -56,6 +64,7 @@ async def completions(program_id: str, request: Request):
     acquire_backend(backend)
 
     async def generator():
+        output_text = ""
         try:
             async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
                 # record execution start (pins preferred_engine if needed)
@@ -71,11 +80,33 @@ async def completions(program_id: str, request: Request):
                     json=body,
                 ) as resp:
                     async for chunk in resp.aiter_raw():
+                        output_text += chunk.decode() if isinstance(chunk, bytes) else chunk
                         yield chunk
 
         finally:
-            # record completion
-            PROCESS_TABLE.record_call_completion(program_id, call_id)
+            # Extract output tokens from accumulated response
+            output_tokens = None
+            if output_text:
+                try:
+                    import json
+                    for line in output_text.strip().split('\n'):
+                        if line.startswith('data: '):
+                            data_str = line[6:]  # Remove 'data: ' prefix
+                            if data_str.strip() == '[DONE]':
+                                continue
+                            data = json.loads(data_str)
+                            if "choices" in data:
+                                choice = data["choices"][0] if data["choices"] else {}
+                                text = choice.get("text", "") or choice.get("delta", {}).get("content", "")
+                                if text:
+                                    tok = get_tokenizer()
+                                    output_tokens = len(tok.encode(text, add_special_tokens=False))
+                                    break  # Get first valid text
+                except Exception:
+                    pass  # Ignore parsing errors
+            
+            # record completion with output tokens
+            PROCESS_TABLE.record_call_completion(program_id, call_id, output_tokens=output_tokens)
 
             # release backend slot
             release_backend(backend)

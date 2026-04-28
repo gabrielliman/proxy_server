@@ -94,6 +94,9 @@ def summarize_program(prog: ProgramMetrics) -> Dict[str, Any]:
 
         "mean_e2el_ms": float(np.mean(latencies)) * 1000 if latencies else None,
         "median_e2el_ms": float(np.median(latencies)) * 1000 if latencies else None,
+        "p75_e2el_ms": percentile(latencies, 75) * 1000 if latencies else None,
+        "p90_e2el_ms": percentile(latencies, 90) * 1000 if latencies else None,
+        "p95_e2el_ms": percentile(latencies, 95) * 1000 if latencies else None,
         "p99_e2el_ms": percentile(latencies, 99) * 1000 if latencies else None,
     }
 
@@ -118,7 +121,9 @@ def calculate_percentile_thresholds(
 
 def separate_requests_by_latency(
     program: ProgramMetrics,
-    percentiles: List[int] = [50, 75, 90, 95, 99]
+    percentiles: List[int] = [50, 75, 90, 95, 99],
+    path: str = "",
+    is_baseline: bool = False
 ) -> Dict[str, Any]:
     
     if not program.requests:
@@ -128,7 +133,10 @@ def separate_requests_by_latency(
             "metrics_per_percentile": {}
         }
     
-    thresholds = calculate_percentile_thresholds(program.requests, percentiles)
+    if(is_baseline):
+        thresholds = calculate_percentile_thresholds(program.requests, percentiles)
+    else:
+        thresholds = get_baseline_metrics(path)
     
     percentile_buckets = {}
     for p in sorted(percentiles):
@@ -207,12 +215,14 @@ def separate_requests_by_latency(
 
 def separate_all_programs_by_latency(
     program_results: List[ProgramMetrics],
-    percentiles: List[int] = [50, 75, 90, 95, 99]
+    percentiles: List[int] = [50, 75, 90, 95, 99],
+    path: str = "",
+    is_baseline: bool = False
 ) -> Dict[str, Any]:
 
     results = {}
     for program in program_results:
-        results[program.program_id] = separate_requests_by_latency(program, percentiles)
+        results[program.program_id] = separate_requests_by_latency(program, percentiles,path,is_baseline)
     
     return results
 
@@ -257,7 +267,9 @@ def summarize_full(prog: ProgramMetrics) -> Dict[str, Any]:
 
         "mean_e2el_ms": float(np.mean(latencies)) * 1000 if latencies else None,
         "median_e2el_ms": float(np.median(latencies)) * 1000 if latencies else None,
+        "p75_e2el_ms": percentile(latencies, 75) * 1000 if latencies else None,
         "p90_e2el_ms": percentile(latencies, 90) * 1000 if latencies else None,
+        "p95_e2el_ms": percentile(latencies, 95) * 1000 if latencies else None,
         "p99_e2el_ms": percentile(latencies, 99) * 1000 if latencies else None,
 
     }
@@ -443,28 +455,67 @@ async def send_stateful_request(
 # ============================================================
 # Benchmark orchestration
 # ============================================================
+import numpy as np
+import asyncio
+import time
+
+
 class RateLimiter:
     """
-    Simple async rate limiter: allows `rate` acquisitions per second.
+    Async rate limiter with optional burstiness.
+    
+    If burstiness == 1 → Poisson (exponential intervals)
+    If burstiness < 1 → bursty
+    If burstiness > 1 → more uniform
+    If burstiness == inf → deterministic interval
     """
-    def __init__(self, rate: float):
+
+    def __init__(self, rate: float, burstiness: float = 1.0):
         self.rate = rate
-        self._interval = 1.0 / rate if rate > 0 else 0.0
-        self._last = time.perf_counter()
+        self.burstiness = burstiness
         self._lock = asyncio.Lock()
+
+        if rate > 0 and rate != float("inf"):
+            self._mean_interval = 1.0 / rate
+        else:
+            self._mean_interval = 0.0
+
+        self._last = time.perf_counter()
+
+    def _sample_interval(self) -> float:
+        """
+        Sample next inter-arrival interval.
+        """
+        if self.rate <= 0 or self.rate == float("inf"):
+            return 0.0
+
+        if self.burstiness == float("inf"):
+            return self._mean_interval
+
+        # Gamma sampling
+        theta = 1.0 / (self.rate * self.burstiness)
+        interval=np.random.gamma(
+            shape=self.burstiness,
+            scale=theta
+        )
+        # print(f"[RateLimiter] Sampled interval: {interval:.4f}s (burstiness={self.burstiness})")
+        return interval
 
     async def acquire(self):
         if self.rate <= 0 or self.rate == float("inf"):
             return
 
         async with self._lock:
+            interval = self._sample_interval()
+
             now = time.perf_counter()
-            elapsed = now - self._last
-            wait = self._interval - elapsed
+            target_time = self._last + interval
+
+            wait = target_time - now
             if wait > 0:
                 await asyncio.sleep(wait)
-            self._last = time.perf_counter()
 
+            self._last = target_time
 
 
 async def run_programs(
@@ -474,6 +525,7 @@ async def run_programs(
     tokenizer,
     max_concurrency: int,
     rps: float,
+    burstiness: float,
     mode: Literal["chat", "completion"],
 ) -> List[ProgramMetrics]:
 
@@ -485,7 +537,7 @@ async def run_programs(
     else:
         semaphore = asyncio.Semaphore(max_concurrency)
 
-    rate_limiter = RateLimiter(rps)
+    rate_limiter = RateLimiter(rps, burstiness)
 
     total_requests = sum(len(prompts) for _, prompts in program_requests)
 
@@ -563,7 +615,10 @@ async def benchmark_sharegpt(
     mode: Literal["chat", "completion"] = "completion",
     burstiness: float = 1.0,
     chat_len: int = 0,
+    output_json_path: str = "",
+    is_baseline: bool = False
 ):
+    print(f"Is baseline run: {is_baseline}")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
@@ -585,7 +640,7 @@ async def benchmark_sharegpt(
         if user_msgs:
             # print(pid)
             # if(len(user_msgs)==2):
-            if(chat_len>=0):
+            if(chat_len>0):
                 if(len(user_msgs)>=chat_len):
                     user_msgs=user_msgs[:chat_len]
                     program_requests.append((pid, user_msgs))
@@ -607,6 +662,7 @@ async def benchmark_sharegpt(
         tokenizer,
         max_concurrency,
         rps,
+        burstiness,
         mode,
     )
 
@@ -617,7 +673,9 @@ async def benchmark_sharegpt(
     
     latency_separation = separate_all_programs_by_latency(
         program_results,
-        percentiles=[50, 75, 90, 95, 99]
+        percentiles=[50, 75, 90, 95, 99],
+        is_baseline=is_baseline,
+        path=output_json_path
     )
     
     all_requests = [r for p in program_results for r in p.requests]
@@ -626,7 +684,9 @@ async def benchmark_sharegpt(
     
     full_latency_separation = separate_requests_by_latency(
         full_prog,
-        percentiles=[50, 75, 90, 95, 99]
+        percentiles=[50, 75, 90, 95, 99],
+        path=output_json_path,
+        is_baseline=is_baseline
     )
     
     # ---- per-program E2EL aggregation ----
@@ -668,28 +728,85 @@ async def benchmark_sharegpt(
 
     return per_program_metrics, full_metrics, latency_separation, full_latency_separation
 
-def get_baseline_metrics(baseline_path,request_rate):
-    base_dir = "/scratch/global/proxy_server/" + baseline_path
-    rate = "_rate" + str(int(request_rate))
-    files = [f for f in os.listdir(base_dir) if f.endswith('.json') and rate in f]
+import os
+import json
+import re
+import glob
+
+def get_baseline_metrics(output_json_path):
+    """
+    Recebe:
+        output_${scheduler}_${strategy}_rate${rate}_run${RUN}.json
+
+    Encontra automaticamente todos os:
+        baseline_output_{scheduler}_round-robin_rate{rate}_run*.json
+
+    E retorna a média das métricas.
+    """
+
+    # --------------------------------------------------
+    # 1) Extrair scheduler e rate do nome do arquivo
+    # --------------------------------------------------
+    filename = os.path.basename(output_json_path)
+
+    match = re.search(r"output_([^_]+)_.+_rate(\d+)_run\d+\.json", filename)
+    if not match:
+        raise ValueError(f"Nome de arquivo inesperado: {filename}")
+
+    scheduler = match.group(1)
+    rate = match.group(2)
+
+    # --------------------------------------------------
+    # 2) Procurar baselines correspondentes
+    # --------------------------------------------------
+    base_dir = os.path.dirname(output_json_path)
+
+    pattern = os.path.join(
+        base_dir,
+        f"baseline_output_{scheduler}_round-robin_rate{rate}_run*.json"
+    )
+
+    files = glob.glob(pattern)
+
+    if len(files) == 0:
+        raise ValueError(
+            f"Nenhum baseline encontrado para scheduler={scheduler}, rate={rate}"
+        )
+    # --------------------------------------------------
+    # 4) Agregar métricas
+    # --------------------------------------------------
     median_e2el_ms = 0
+    p75_e2el_ms = 0
     p90_e2el_ms = 0
+    p95_e2el_ms = 0
     p99_e2el_ms = 0
+
+    for full_path in files:
+        with open(full_path, "r") as file:
+            data = json.load(file)
+
+            median_e2el_ms += data["full_metrics"]["median_e2el_ms"]
+            p75_e2el_ms += data["full_metrics"]["p75_e2el_ms"]
+            p90_e2el_ms += data["full_metrics"]["p90_e2el_ms"]
+            p95_e2el_ms += data["full_metrics"]["p95_e2el_ms"]
+            p99_e2el_ms += data["full_metrics"]["p99_e2el_ms"]
+
+
     count = len(files)
 
-    for filename in files:
-        full_path = os.path.join(base_dir, filename)
-        with open(full_path, 'r') as file:
-            data = json.load(file)
-            median_e2el_ms += data["full_metrics"]["median_e2el_ms"]
-            p90_e2el_ms += data["full_metrics"]["p90_e2el_ms"]
-            p99_e2el_ms += data["full_metrics"]["p99_e2el_ms"]
-    
-    median_e2el_ms = median_e2el_ms/count
-    p90_e2el_ms = p90_e2el_ms/count
-    p99_e2el_ms = p99_e2el_ms/count
+    median_e2el_ms /= count
+    p75_e2el_ms /= count
+    p90_e2el_ms /= count
+    p95_e2el_ms /= count
+    p99_e2el_ms /= count
 
-    return median_e2el_ms, p90_e2el_ms, p99_e2el_ms
+    return {
+        50: median_e2el_ms/1000,
+        75: p75_e2el_ms/1000,
+        90: p90_e2el_ms/1000,
+        95: p95_e2el_ms/1000,
+        99: p99_e2el_ms/1000,
+    }
 
 
 # ============================================================
@@ -716,13 +833,15 @@ if __name__ == "__main__":
     default="chat",
     help="Which OpenAI-style API to use",
     )
-    parser.add_argument("--baseline_path",default="outputs_baseline")
     parser.add_argument("--is_baseline_run",default=0)
     args = parser.parse_args()
 
-    # baseline metrics
-    if args.is_baseline_run == "0":
-        median_e2el_ms, p90_e2el_ms, p99_e2el_ms = get_baseline_metrics(args.baseline_path,args.request_rate)
+
+    print(args.is_baseline_run)
+    if(args.is_baseline_run=="0"):
+        is_baseline=False
+    else:
+        is_baseline=True
 
     per_program, full_metrics, latency_separation, full_latency_separation = asyncio.run(
         benchmark_sharegpt(
@@ -735,6 +854,8 @@ if __name__ == "__main__":
             rps=args.request_rate,
             burstiness=args.burstiness,
             chat_len=args.chat_len,
+            output_json_path=args.output_json,
+            is_baseline=is_baseline
         )
     )
 
@@ -793,4 +914,4 @@ if __name__ == "__main__":
             json.dump(to_save, f, indent=2)
         print(f"\nSaved metrics JSON to: {out_path}")
 
-# python benchmark_stateful.py --base-url http://localhost:8080 --dataset /scratch/global/datasets/ShareGPT_V3_unfiltered_cleaned_split.json --model Qwen/Qwen3-4B --limit 20 --output-json request_test.json --request_rate 1
+# python benchmark_stateful.py --base-url http://localhost:8081 --dataset /scratch/global/datasets/ShareGPT_V3_unfiltered_cleaned_split.json --model meta-llama/Llama-3.1-8B-Instruct --limit 20 --output-json request_test.json --request-rate 10 --burstiness 0.1 --is_baseline_run 1

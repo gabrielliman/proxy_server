@@ -14,8 +14,7 @@ DATASET="/scratch/global/datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
 
 MODEL="meta-llama/Llama-3.1-8B-Instruct"
 LIMIT=50
-OUTPUTS_DIR="outputs_benchmark_50_25_LLama_2GPU"
-
+OUTPUTS_DIR="outputs_llama_50_2gpu_burstiness_015"
 mkdir -p "$OUTPUTS_DIR"
 
 # ============================================================
@@ -36,21 +35,21 @@ PREFIX_URL=(
 # ============================================================
 # Experiment grid
 # ============================================================
-REPEATS=5
+REPEATS=3
 
 SCHEDULERS=("fcfs" "plas") 
 LOAD_BALANCER_STRATEGIES=(
-  "round-robin"
-  "least-total-load"
-#   "least-waiting"
-#   "least-kv-cache"
+  #"round-robin"
+  #"least-total-load"
+  "least-waiting"
+  #"least-kv-cache"
   "autellix"
-#   "kv-cache"
+  #"kv-cache"
   "kv-threshold-autellix"
 ) 
-# RATES=("8" "16" "32")
+# RATES=("32")
 # RATES=("50")
-RATES=("1" "4" "8" "16" "32" )
+RATES=("4" "8" "16" "32" "64")
 
 # ============================================================
 # Helper: scrape per-engine metrics
@@ -84,7 +83,113 @@ get_prefix_metrics_per_engine() {
     }'
 }
 
+# ============================================================
+# baseline LOOP
+# ============================================================
 
+for scheduler in "${SCHEDULERS[@]}"; do
+for rate in "${RATES[@]}"; do
+
+     # ------------------------------------
+     # Start proxy server
+     # ------------------------------------
+     # variar o sheduler
+    SCHEDULER="$scheduler" \
+    LOAD_BALANCER_STRATEGY="round-robin" \
+    python main.py &
+    PROXY_PID=$!
+    sleep 10  # tempo para proxy + engines estabilizarem
+    for RUN in $(seq 1 $REPEATS); do
+
+        echo "Run $RUN / $REPEATS"
+
+        for url in "${RESET_URLS[@]}"; do
+            curl -s -X POST "$url" > /dev/null
+        done
+        sleep 2
+
+        unset before_q before_h prefix_json_map
+        declare -A before_q
+        declare -A before_h
+
+        for url in "${PREFIX_URL[@]}"; do
+            while read -r engine q h; do
+                before_q[$engine]=$q
+                before_h[$engine]=$h
+            done < <(get_prefix_metrics_per_engine "$url")
+        done
+        # colocar na mesma pasta dos outros
+        OUTPUT_JSON="${OUTPUTS_DIR}/baseline_output_${scheduler}_round-robin_rate${rate}_run${RUN}.json"
+        python benchmark_stateful.py \
+            --base-url "$BASE_URL" \
+            --dataset "$DATASET" \
+            --model "$MODEL" \
+            --limit "$LIMIT" \
+            --request-rate "$rate" \
+            --mode "chat" \
+            --output-json "$OUTPUT_JSON" \
+            --chat_len 25 \
+            --is_baseline_run 1 \
+            --burstiness 0.15
+    done
+    #Matando o proxy
+    echo "Stopping proxy (PID=$PROXY_PID)"
+    kill "$PROXY_PID"
+    wait "$PROXY_PID" 2>/dev/null || true
+    sleep 5
+
+    declare -A prefix_json_map
+
+        for url in "${PREFIX_URL[@]}"; do
+            while read engine q h; do
+                before_queries=${before_q[$engine]:-0}
+                before_hits=${before_h[$engine]:-0}
+                dq=$(echo "$q - $before_queries" | bc)
+                dh=$(echo "$h - $before_hits" | bc)
+                hr=$(awk -v dh="$dh" -v dq="$dq" 'BEGIN { if (dq>0) printf "%.6f", dh/dq; else print 0 }')
+                prefix_json_map[$engine]="{\"queries\":$dq,\"hits\":$dh,\"hit_rate\":$hr}"
+            done < <(get_prefix_metrics_per_engine "$url")
+        done
+
+#         # ------------------------------------
+#         # Build JSON object
+#         # ------------------------------------
+        prefix_json="{"
+        first=1
+        for engine in "${!prefix_json_map[@]}"; do
+            if [ $first -eq 0 ]; then
+                prefix_json+=","
+            fi
+            prefix_json+="\"engine_${engine}\":${prefix_json_map[$engine]}"
+            first=0
+        done
+
+        prefix_json+="}"
+
+        # ------------------------------------
+        # Inject into benchmark JSON
+        # ------------------------------------
+        tmp=$(mktemp)
+
+        jq \
+        --argjson prefix "$prefix_json" \
+        --arg scheduler "$scheduler" \
+        --arg strategy "$strategy" \
+        --arg rate "$rate" \
+        --arg num_conversations "$LIMIT" \
+        '
+        .full_metrics.prefix_cache = $prefix
+        | .full_metrics.scheduler = $scheduler
+        | .full_metrics.load_balancer = $strategy
+        | .full_metrics.request_rate = ($rate | tonumber)
+        | .full_metrics.num_conversations = ($num_conversations | tonumber)
+        ' "$OUTPUT_JSON" > "$tmp" && mv "$tmp" "$OUTPUT_JSON"
+
+        echo "Metrics injected into JSON"
+        echo "--------------------------------------"
+
+done
+done
 
 # ============================================================
 # MAIN LOOP
@@ -92,11 +197,6 @@ get_prefix_metrics_per_engine() {
 
 for scheduler in "${SCHEDULERS[@]}"; do
 for rate in "${RATES[@]}"; do
-
-#INICIA PROXY
-#RODAR BASELINE
-#MATA PROXY
-#PARSER DAS INFORMACOES DO JSON E TER COMO VARIAVEL NO SCRIPT
 
 for strategy in "${LOAD_BALANCER_STRATEGIES[@]}"; do
 
@@ -150,12 +250,8 @@ for strategy in "${LOAD_BALANCER_STRATEGIES[@]}"; do
             --mode "chat" \
             --output-json "$OUTPUT_JSON" \
             --chat_len 25 \
-            # PASSAR AS NOVAS VARIAVEIS EXTRAIDAS
-
-        echo "Stopping proxy (PID=$PROXY_PID)"
-        kill "$PROXY_PID"
-        wait "$PROXY_PID" 2>/dev/null || true
-        sleep 5
+            --is_baseline_run 0 \
+            --burstiness 0.15
 
         # ------------------------------------
         # AFTER metrics + compute delta
@@ -222,6 +318,10 @@ for strategy in "${LOAD_BALANCER_STRATEGIES[@]}"; do
     # ------------------------------------
     # Stop proxy server
     # ------------------------------------
+    echo "Stopping proxy (PID=$PROXY_PID)"
+    kill "$PROXY_PID"
+    wait "$PROXY_PID" 2>/dev/null || true
+    sleep 5
 done
 done
 done

@@ -9,3 +9,4 @@ benchmark_results.json
 *.txt
 *.csv
 var/
+*.pt

@@ -19,6 +19,10 @@ class ProcessTable:
                     "service_ewma": None,
                     "call_count": 0,
 
+                    # KV token-time metric (d*c = pd + d²/2)
+                    "kv_token_time_cumulative": 0.0,
+                    "kv_token_time_ewma": None,
+
                     # NEW (Autellix Alg.2, line 6)
                     "preferred_engine": None,
 
@@ -34,7 +38,7 @@ class ProcessTable:
             if program_id in self.table:
                 del self.table[program_id]
 
-    def record_call_arrival(self, program_id: str, call_id: str, arrival_time: float = None):
+    def record_call_arrival(self, program_id: str, call_id: str, arrival_time: float = None, prefill_tokens: int = None):
         now = arrival_time or time.time()
         self.ensure_process(program_id)
         with self.lock:
@@ -49,7 +53,10 @@ class ProcessTable:
                 "service_time": 0.0,
                 "engine_id": None,
                 "state": "waiting",
-                #salvar numero de tokens de entrada
+                # KV token tracking
+                "prefill_tokens": prefill_tokens,
+                "decode_tokens": None,
+                "kv_token_time": None,
             }
             entry["most_recent_call_arrival"] = now
 
@@ -134,7 +141,34 @@ class ProcessTable:
             if entry:
                 entry["preferred_engine"] = None
 
-    def record_call_completion(self, program_id: str, call_id: str, completion_time: float = None):
+    def record_kv_tokens(self, program_id: str, call_id: str, prefill_tokens: int, decode_tokens: int):
+        """Record KV token counts and calculate KV token-time.
+        
+        KV token-time formula: d*c = pd + d²/2
+        Where:
+            p = prefill_tokens (input tokens)
+            d = decode_tokens (output tokens)
+        """
+        with self.lock:
+            entry = self.table.get(program_id)
+            if not entry:
+                return
+            th = entry["threads"].get(call_id)
+            if not th:
+                return
+            
+            # Store token counts
+            th["prefill_tokens"] = prefill_tokens
+            th["decode_tokens"] = decode_tokens
+            
+            # Calculate KV token-time: pd + d²/2
+            kv_time = (prefill_tokens * decode_tokens) + (decode_tokens ** 2) / 2
+            th["kv_token_time"] = kv_time
+            
+            # Update cumulative
+            entry["kv_token_time_cumulative"] = entry.get("kv_token_time_cumulative", 0.0) + kv_time
+
+    def record_call_completion(self, program_id: str, call_id: str, completion_time: float = None, output_tokens: int = None):
         now = completion_time or time.time()
         with self.lock:
             entry = self.table.get(program_id)
@@ -168,6 +202,26 @@ class ProcessTable:
                 alpha = 0.3
                 entry["service_ewma"] = alpha * service + (1 - alpha) * ewma
 
+            # Update KV token-time EWMA if tokens were recorded
+            prefill_tokens = th.get("prefill_tokens")
+            decode_tokens = output_tokens if output_tokens is not None else th.get("decode_tokens")
+            
+            if prefill_tokens is not None and decode_tokens is not None:
+                # Calculate KV token-time: pd + d²/2
+                kv_time = (prefill_tokens * decode_tokens) + (decode_tokens ** 2) / 2
+                th["kv_token_time"] = kv_time
+                th["decode_tokens"] = decode_tokens
+                
+                # Update cumulative
+                entry["kv_token_time_cumulative"] = entry.get("kv_token_time_cumulative", 0.0) + kv_time
+                
+                # Update EWMA
+                kv_ewma = entry.get("kv_token_time_ewma")
+                if kv_ewma is None:
+                    entry["kv_token_time_ewma"] = kv_time
+                else:
+                    entry["kv_token_time_ewma"] = alpha * kv_time + (1 - alpha) * kv_ewma
+
             entry["most_recent_call_completion"] = now
 
             # remove engine assignment if no other running thread uses it
@@ -199,6 +253,9 @@ class ProcessTable:
                 "threads": threads_copy,
                 "most_recent_call_arrival": entry["most_recent_call_arrival"],
                 "most_recent_call_completion": entry["most_recent_call_completion"],
+                # KV token-time metrics
+                "kv_token_time_cumulative": entry.get("kv_token_time_cumulative", 0.0),
+                "kv_token_time_ewma": entry.get("kv_token_time_ewma"),
             }
 
         return result
@@ -267,6 +324,9 @@ class ProcessTable:
                 "call_count": entry.get("call_count", 0),
                 "service_time_cumulative": entry.get("service_time_cumulative", 0.0),
                 "most_recent_call_arrival": entry.get("most_recent_call_arrival"),
+                # KV token-time metrics
+                "kv_token_time_ewma": entry.get("kv_token_time_ewma"),
+                "kv_token_time_cumulative": entry.get("kv_token_time_cumulative", 0.0),
             }
 
     def start_async_pruner(self, interval_seconds: float, ttl_seconds: float):

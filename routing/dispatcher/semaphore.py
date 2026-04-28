@@ -5,11 +5,12 @@ import httpx
 import time
 from routing.dispatcher.base import BaseDispatcher
 from routing.queue_manager import get_queue, put_request, get_request
-from config.settings import BACKEND_PARALLELISM, REQUEST_TIMEOUT, SCHEDULER
+from config.settings import BACKEND_PARALLELISM, REQUEST_TIMEOUT, SCHEDULER, MODEL
 from routing.scheduler_plas import compute_priority
-
+from utils.tokenizer_utils import get_tokenizer
 
 class SemaphoreDispatcher(BaseDispatcher):
+
     def __init__(self):
         # um semáforo por backend
         self.semaphores = {}
@@ -67,14 +68,25 @@ class SemaphoreDispatcher(BaseDispatcher):
         # 🔥 Entrada no semáforo = limite de concorrência real
         async with sem:
             start = None
+            output_tokens = None
             try:
                 start = time.time()
                 if pid and cid:
                     PROCESS_TABLE.record_call_start(pid, cid, engine_id=backend, start_time=start)
 
                 resp = await client.post(f"{backend}/v1/chat/completions", json=data)
+                resp_json = resp.json()
+                
+                # Extract output tokens from response
+                if resp_json and "choices" in resp_json:
+                    choice = resp_json["choices"][0] if resp_json["choices"] else {}
+                    text = choice.get("message", {}).get("content", "") or choice.get("text", "")
+                    if text:
+                        tok = get_tokenizer()
+                        output_tokens = len(tok.encode(text, add_special_tokens=False))
+                
                 if not future.done():
-                    future.set_result(resp.json())
+                    future.set_result(resp_json)
             except Exception as e:
                 if not future.done():
                     future.set_exception(e)
@@ -82,6 +94,6 @@ class SemaphoreDispatcher(BaseDispatcher):
             finally:
                 end = time.time()
                 if pid and cid:
-                    PROCESS_TABLE.record_call_completion(pid, cid, completion_time=end)
+                    PROCESS_TABLE.record_call_completion(pid, cid, completion_time=end, output_tokens=output_tokens)
 
         return await future
