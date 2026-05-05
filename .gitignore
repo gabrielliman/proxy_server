@@ -8,5 +8,5 @@ benchmark_results.json
 *.json
 *.txt
 *.csv
-var/
+var/logs/*
 *.pt

@@ -5,16 +5,30 @@ set -e
 # Environment
 # ============================================================
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate /scratch/global/abacus
+
+ENV_NAME=$(grep "name:" env.yml | sed 's/name: //')
+
+# Verifica se a pasta do ambiente existe no diretório de envs do conda
+if conda info --envs | grep -q "$ENV_NAME"; then
+    echo "Ambiente '$ENV_NAME' já existe. Pulando criação."
+else
+    echo "Criando ambiente '$ENV_NAME' a partir do env.yml..."
+    conda env create -f env.yml
+fi
+
+conda activate proxy_server
 
 BASE_URL="http://localhost:8081"
-DATASET="/scratch/global/datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
+DATASET="./ShareGPT_V3_unfiltered_cleaned_split.json"
 
+if [ ! -f "$DATASET" ]; then
+    curl -L https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json -o "$DATASET"
+fi
 
 
 MODEL="meta-llama/Llama-3.1-8B-Instruct"
-LIMIT=50
-OUTPUTS_DIR="outputs_llama_50_2gpu_burstiness_015"
+LIMIT=10
+OUTPUTS_DIR="outputs/teste"
 mkdir -p "$OUTPUTS_DIR"
 
 # ============================================================
@@ -23,33 +37,32 @@ mkdir -p "$OUTPUTS_DIR"
 # ============================================================
 RESET_URLS=(
   "http://localhost:8105/reset_prefix_cache"
-  "http://localhost:8106/reset_prefix_cache"
+#   "http://localhost:8106/reset_prefix_cache"
 )
 
 PREFIX_URL=(
   "http://localhost:8105/metrics"
-  "http://localhost:8106/metrics"
+#   "http://localhost:8106/metrics"
 )
 
 
 # ============================================================
 # Experiment grid
 # ============================================================
-REPEATS=3
+REPEATS=1
 
-SCHEDULERS=("fcfs" "plas") 
+SCHEDULERS=("plas") 
 LOAD_BALANCER_STRATEGIES=(
   #"round-robin"
   #"least-total-load"
   "least-waiting"
   #"least-kv-cache"
-  "autellix"
+#   "autellix"
   #"kv-cache"
-  "kv-threshold-autellix"
+#   "kv-threshold-autellix"
 ) 
-# RATES=("32")
-# RATES=("50")
-RATES=("4" "8" "16" "32" "64")
+
+RATES=("64")
 
 # ============================================================
 # Helper: scrape per-engine metrics
@@ -118,7 +131,6 @@ for rate in "${RATES[@]}"; do
                 before_h[$engine]=$h
             done < <(get_prefix_metrics_per_engine "$url")
         done
-        # colocar na mesma pasta dos outros
         OUTPUT_JSON="${OUTPUTS_DIR}/baseline_output_${scheduler}_round-robin_rate${rate}_run${RUN}.json"
         python benchmark_stateful.py \
             --base-url "$BASE_URL" \
@@ -128,9 +140,9 @@ for rate in "${RATES[@]}"; do
             --request-rate "$rate" \
             --mode "chat" \
             --output-json "$OUTPUT_JSON" \
-            --chat_len 25 \
+            --chat_len 10 \
             --is_baseline_run 1 \
-            --burstiness 0.15
+            --burstiness 0.01
     done
     #Matando o proxy
     echo "Stopping proxy (PID=$PROXY_PID)"
@@ -249,9 +261,9 @@ for strategy in "${LOAD_BALANCER_STRATEGIES[@]}"; do
             --request-rate "$rate" \
             --mode "chat" \
             --output-json "$OUTPUT_JSON" \
-            --chat_len 25 \
+            --chat_len 10 \
             --is_baseline_run 0 \
-            --burstiness 0.15
+            --burstiness 0.01
 
         # ------------------------------------
         # AFTER metrics + compute delta
@@ -325,8 +337,37 @@ for strategy in "${LOAD_BALANCER_STRATEGIES[@]}"; do
 done
 done
 done
-mv /scratch/global/proxy_server/kv_cache_usage.csv "$OUTPUTS_DIR/kv_cache_usage.csv"
+mv ./kv_cache_usage.csv "$OUTPUTS_DIR/kv_cache_usage.csv"
 
 echo "======================================"
 echo "All benchmarks completed successfully."
 echo "======================================"
+
+
+#!/bin/bash
+
+# Portas que definimos no script de início
+PORTS=(8105 8106)
+
+echo "[INFO] Iniciando encerramento dos servidores vLLM..."
+
+for PORT in "${PORTS[@]}"; do
+    PID=$(lsof -t -i:$PORT)
+
+    if [ -z "$PID" ]; then
+        echo "[WARN] Nenhum processo encontrado na porta $PORT."
+    else
+    
+        kill $PID
+        # Aguarda um momento para ver se o processo fechou
+        sleep 2
+        
+        # Se ainda estiver rodando, força o encerramento (SIGKILL)
+        if ps -p $PID > /dev/null; then
+            echo "[WARN] Processo $PID não respondeu ao SIGTERM, forçando SIGKILL..."
+            kill -9 $PID
+        else
+            echo "[OK] Servidor na porta $PORT encerrado com sucesso."
+        fi
+    fi
+done

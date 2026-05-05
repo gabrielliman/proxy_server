@@ -1,32 +1,43 @@
 #!/bin/bash
+
 set -e
 
-export HF_HOME="/scratch/global/huggingface_cache/huggingface"
+ENV_NAME="vllm_env"
+PYTHON_VERSION="3.12"
 
-# Paths and ports
+# Inicializa o Conda para este script (necessário para o comando 'conda activate' funcionar no bash)
+eval "$(conda shell.bash hook)"
+
+# Verifica se o ambiente Conda já existe
+if ! conda info --envs | grep -q "^$ENV_NAME "; then
+    echo "Ambiente Conda '$ENV_NAME' não encontrado. Criando um novo..."
+    conda create -n "$ENV_NAME" python="$PYTHON_VERSION" -y
+else
+    echo "Ambiente Conda '$ENV_NAME' já existe. Ignorando a criação."
+fi
+
+echo "Ativando o ambiente Conda '$ENV_NAME'..."
+conda activate "$ENV_NAME"
+
+echo "Instalando vllm com uv..."
+# O uv pip reconhece automaticamente o ambiente Conda ativo
+uv pip install vllm --torch-backend=auto
+
+echo "Configuração e instalação concluídas com sucesso!"
+
+
+# export HF_HOME="/scratch/global/huggingface_cache/huggingface"
+
 MODEL1_NAME="meta-llama/Llama-3.1-8B-Instruct"
 MODEL2_NAME="meta-llama/Llama-3.1-8B-Instruct"
-# MODEL3_NAME="meta-llama/Llama-3.1-8B-Instruct"
-# "meta-llama/Llama-3.1-8B-Instruct"
-# "Qwen/Qwen2.5-1.5B-Instruct"
-# "Qwen/Qwen2.5-0.5B-Instruct"
-# "Qwen/Qwen3-0.6B"
-# "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
 
-EMBEDDING_PORT=8001
 MODEL1_PORT=8105
 MODEL2_PORT=8106
-#MODEL3_PORT=8007
-
 
 MODEL1_MAX_NUM_SEQS=10
 MODEL2_MAX_NUM_SEQS=10
 
 LOG_DIR="./var/logs"
-
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate /scratch/global/abacus
-
 
 wait_for_ready() {
   local PORT=$1
@@ -37,33 +48,19 @@ wait_for_ready() {
   echo "[INFO] Model on port $PORT is ready!"
 }
 
-
-# echo "[INFO] Starting vLLM embedding server"
-# export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-# CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.openai.api_server --model nomic-ai/nomic-embed-text-v1 --task embed --port $EMBEDDING_PORT --trust-remote-code --max-model-len 8K &
-# PIDEmbedding=$!
-# wait_for_ready $EMBEDDING_PORT
 export VLLM_SERVER_DEV_MODE=1
 
 
 echo "[INFO] Starting vLLM inference servers"
 
-CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.openai.api_server --model "$MODEL1_NAME" --port $MODEL1_PORT --max-num-seqs $MODEL1_MAX_NUM_SEQS --dtype bfloat16 --max-model-len 40000 --gpu-memory-utilization 0.9  2>&1 | tee "$LOG_DIR/saida_VLLM_$MODEL1_PORT.txt" &
+CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.openai.api_server --model "$MODEL1_NAME" --port $MODEL1_PORT --max-num-seqs $MODEL1_MAX_NUM_SEQS --dtype bfloat16 --max-model-len 40000 --gpu-memory-utilization 0.9  2>&1| tee "$LOG_DIR/saida_VLLM_$MODEL1_PORT.txt" &
 PID1=$!
 wait_for_ready $MODEL1_PORT
 
-# CUDA_VISIBLE_DEVICES=0 python -u -m vllm.entrypoints.openai.api_server --model "$MODEL2_NAME" --port $MODEL2_PORT --max-num-seqs $MODEL2_MAX_NUM_SEQS --dtype bfloat16 --max-model-len 40000 --gpu-memory-utilization 0.9 2>&1 | tee "$LOG_DIR/saida_VLLM_$MODEL2_PORT.txt" &
+#Se quiser outra copia, so descomentar as linhas abaixo
+# CUDA_VISIBLE_DEVICES=1 python -u -m vllm.entrypoints.openai.api_server --model "$MODEL2_NAME" --port $MODEL2_PORT --max-num-seqs $MODEL2_MAX_NUM_SEQS --dtype bfloat16 --max-model-len 40000 --gpu-memory-utilization 0.5 2>&1 | tee "$LOG_DIR/saida_VLLM_$MODEL2_PORT.txt" &
 # PID2=$!
 # wait_for_ready $MODEL2_PORT
 
 
-
-
-# CUDA_VISIBLE_DEVICES=0,1 python -m vllm.entrypoints.openai.api_server --tensor-parallel-size 2 --model "$MODEL3_NAME" --port $MODEL3_PORT --dtype bfloat16 --max-model-len 20000 --gpu-memory-utilization 0.3  2>&1 | tee "$LOG_DIR/saida_VLLM_$MODEL3_PORT.txt" &
-# PID3=$!
-# wait_for_ready $MODEL3_PORT
-
-
-
-
-wait $PID1 $PID2 # $PIDEmbedding
+wait $PID1 $PID2

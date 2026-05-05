@@ -913,5 +913,3 @@ if __name__ == "__main__":
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(to_save, f, indent=2)
         print(f"\nSaved metrics JSON to: {out_path}")
-
-# python benchmark_stateful.py --base-url http://localhost:8081 --dataset /scratch/global/datasets/ShareGPT_V3_unfiltered_cleaned_split.json --model meta-llama/Llama-3.1-8B-Instruct --limit 20 --output-json request_test.json --request-rate 10 --burstiness 0.1 --is_baseline_run 1
