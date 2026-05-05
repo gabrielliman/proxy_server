@@ -16,7 +16,7 @@ MODEL_ROUTES = {
 #nao funciona para o endpoint completions
 BACKEND_PARALLELISM = {
     "http://localhost:8105": 15, #50% a mais que o paralelismo real
-    "http://localhost:8106": 15,
+    # "http://localhost:8106": 15,
 }
 #FIM
 ALL_BACKENDS = sorted({url for lst in MODEL_ROUTES.values() for url in lst})

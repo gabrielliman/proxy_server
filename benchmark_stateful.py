@@ -292,6 +292,7 @@ async def send_request(
     temperature: float,
     prompt: str | None = None,
     messages: List[Dict[str, str]] | None = None,
+    kv_token_time: float | None = None,  # NOVO: Recebe o tempo do KV token
 ) -> Tuple[RequestMetrics, str]:
 
     if mode == "completion":
@@ -316,6 +317,9 @@ async def send_request(
 
     else:
         raise ValueError(f"Invalid mode: {mode}")
+    
+    if kv_token_time is not None:
+        payload["kv_token_time"] = kv_token_time
 
     # ---------------------------
     # Token estimation (aligned with your LB)
@@ -402,6 +406,7 @@ async def send_stateful_request(
     conversation_state: dict,
     max_tokens=100,
     temperature=0.0,
+    kv_token_time=None,
 ):
 
     if mode == "completion":
@@ -418,6 +423,7 @@ async def send_stateful_request(
             prompt=prompt,
             max_tokens=max_tokens,
             temperature=temperature,
+            kv_token_time=kv_token_time,
         )
 
         conversation_state[program_id] = prompt + "\n\n" + text
@@ -443,11 +449,13 @@ async def send_stateful_request(
         messages=messages,
         max_tokens=max_tokens,
         temperature=temperature,
+        kv_token_time=kv_token_time,
     )
 
     messages.append({"role": "assistant", "content": text})
     conversation_state[program_id] = messages
     # print(text)
+    # print(program_id, kv_token_time)
     return rm
 
 
@@ -527,7 +535,10 @@ async def run_programs(
     rps: float,
     burstiness: float,
     mode: Literal["chat", "completion"],
+    kv_times_map: Dict[str, List[float]] = None,
 ) -> List[ProgramMetrics]:
+    if kv_times_map is None:
+        kv_times_map = {}
 
     # ----------------------------
     # Concurrency & rate limiting
@@ -550,9 +561,10 @@ async def run_programs(
             """
             req_metrics: List[RequestMetrics] = []
             conversation_state = {}
+            prog_kv_times = kv_times_map.get(pid, [])
 
-            for new_message in prompts:
-
+            for idx, new_message in enumerate(prompts):
+                current_kv_time = prog_kv_times[idx] if idx < len(prog_kv_times) else None
                 # ----------------------------
                 # Arrival control (GLOBAL)
                 # ----------------------------
@@ -575,6 +587,7 @@ async def run_programs(
                         model_name=model_name,
                         tokenizer=tokenizer,
                         conversation_state=conversation_state,
+                        kv_token_time=current_kv_time # NOVO: Envia para a função interna
                     )
 
                 req_metrics.append(rm)
@@ -616,11 +629,21 @@ async def benchmark_sharegpt(
     burstiness: float = 1.0,
     chat_len: int = 0,
     output_json_path: str = "",
-    is_baseline: bool = False
+    is_baseline: bool = False,
+    kv_json_path: str = None
 ):
     print(f"Is baseline run: {is_baseline}")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    kv_times_map = {}
+    if kv_json_path and os.path.exists(kv_json_path):
+        with open(kv_json_path, "r", encoding="utf8") as f:
+            kv_data = json.load(f)
+        for prog in kv_data:
+            pid = prog.get("program_id")
+            # Extrai apenas os tempos na ordem em que aparecem no JSON
+            kv_times_map[pid] = [req.get("kv_token_time") for req in prog.get("requests", [])]
 
     with open(dataset_path, "r", encoding="utf8") as f:
         data = json.load(f)
@@ -664,6 +687,7 @@ async def benchmark_sharegpt(
         rps,
         burstiness,
         mode,
+        kv_times_map=kv_times_map,
     )
 
     total_wall = time.perf_counter() - start_wall
@@ -834,6 +858,7 @@ if __name__ == "__main__":
     help="Which OpenAI-style API to use",
     )
     parser.add_argument("--is_baseline_run",default=0)
+    parser.add_argument("--kv-json", type=str, default=None, help="Caminho para o JSON com os kv_token_times")
     args = parser.parse_args()
 
 
@@ -855,7 +880,8 @@ if __name__ == "__main__":
             burstiness=args.burstiness,
             chat_len=args.chat_len,
             output_json_path=args.output_json,
-            is_baseline=is_baseline
+            is_baseline=is_baseline,
+            kv_json_path=args.kv_json
         )
     )
 
@@ -914,4 +940,4 @@ if __name__ == "__main__":
             json.dump(to_save, f, indent=2)
         print(f"\nSaved metrics JSON to: {out_path}")
 
-# python benchmark_stateful.py --base-url http://localhost:8081 --dataset /scratch/global/datasets/ShareGPT_V3_unfiltered_cleaned_split.json --model meta-llama/Llama-3.1-8B-Instruct --limit 20 --output-json request_test.json --request-rate 10 --burstiness 0.1 --is_baseline_run 1
+# python benchmark_stateful.py --base-url http://localhost:8081 --dataset /scratch/global/datasets/ShareGPT_V3_unfiltered_cleaned_split.json --model meta-llama/Llama-3.1-8B-Instruct --limit 20 --output-json request_test.json --request-rate 10 --burstiness 0.1 --is_baseline_run 1 --kv-json /scratch/global/proxy_server/kv_token_time/kv_token_llama_100token.json

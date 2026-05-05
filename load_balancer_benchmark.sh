@@ -11,10 +11,11 @@ BASE_URL="http://localhost:8081"
 DATASET="/scratch/global/datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
 
 
-
+CHAT_LEN=25
+BURSTINESS=0.01
 MODEL="meta-llama/Llama-3.1-8B-Instruct"
 LIMIT=50
-OUTPUTS_DIR="outputs_llama_50_2gpu_burstiness_015"
+OUTPUTS_DIR="outputs/llama_kv_token_time_plas_50_25_bur0.01"
 mkdir -p "$OUTPUTS_DIR"
 
 # ============================================================
@@ -23,12 +24,12 @@ mkdir -p "$OUTPUTS_DIR"
 # ============================================================
 RESET_URLS=(
   "http://localhost:8105/reset_prefix_cache"
-  "http://localhost:8106/reset_prefix_cache"
+#   "http://localhost:8106/reset_prefix_cache"
 )
 
 PREFIX_URL=(
   "http://localhost:8105/metrics"
-  "http://localhost:8106/metrics"
+#   "http://localhost:8106/metrics"
 )
 
 
@@ -37,7 +38,8 @@ PREFIX_URL=(
 # ============================================================
 REPEATS=3
 
-SCHEDULERS=("fcfs" "plas") 
+# SCHEDULERS=("fcfs" "plas") 
+SCHEDULERS=("plas") 
 LOAD_BALANCER_STRATEGIES=(
   #"round-robin"
   #"least-total-load"
@@ -128,9 +130,9 @@ for rate in "${RATES[@]}"; do
             --request-rate "$rate" \
             --mode "chat" \
             --output-json "$OUTPUT_JSON" \
-            --chat_len 25 \
+            --chat_len $CHAT_LEN \
             --is_baseline_run 1 \
-            --burstiness 0.15
+            --burstiness $BURSTINESS
     done
     #Matando o proxy
     echo "Stopping proxy (PID=$PROXY_PID)"
@@ -249,9 +251,9 @@ for strategy in "${LOAD_BALANCER_STRATEGIES[@]}"; do
             --request-rate "$rate" \
             --mode "chat" \
             --output-json "$OUTPUT_JSON" \
-            --chat_len 25 \
+            --chat_len $CHAT_LEN \
             --is_baseline_run 0 \
-            --burstiness 0.15
+            --burstiness $BURSTINESS
 
         # ------------------------------------
         # AFTER metrics + compute delta
