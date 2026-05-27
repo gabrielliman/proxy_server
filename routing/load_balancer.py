@@ -1,52 +1,5 @@
-"""
-Modular load balancer with pluggable routing strategies.
-Supports Autellix-style (short/long routing) and KV-cache-aware routing.
-"""
+import asyncio
 import random
-import asyncio
-import time
-import httpx
-from abc import ABC, abstractmethod
-from threading import Lock
-from typing import Dict, Optional, List
-from config.settings import (
-    ALL_BACKENDS,
-    LOAD_BALANCER_SHORT_REQUEST_THRESHOLD,
-    LOAD_BALANCER_STRATEGY,
-    LOAD_BALANCER_ENABLE_METRICS_QUERY,
-    REQUEST_TIMEOUT,
-)
-from routing.process_table import PROCESS_TABLE
-
-
-class LoadBalancerStrategy(ABC):
-    """Abstract base class for load balancing strategies."""
-
-    @abstractmethod
-    async def select_engine(
-        self, program_id: Optional[str], num_input_tokens: int, metrics: Dict[str, Dict]
-    ) -> str:
-        """
-        Select an engine for the request.
-
-        Args:
-            program_id: Program identifier (None for stateless requests)
-            num_input_tokens: Number of input tokens in request
-            metrics: Dict of {engine_url: {metric_name: value}}
-
-        Returns:
-            Selected engine URL
-        """
-        pass
-"""
-Modular load balancer with pluggable routing strategies.
-Supports Autellix-style (short/long routing) and KV-cache-aware routing.
-
-Provides a background metrics collector that queries engine `/metrics` endpoints
-and logs a compact one-line-per-engine summary every `LOAD_BALANCER_METRICS_LOG_INTERVAL` seconds.
-"""
-
-import asyncio
 import time
 from abc import ABC, abstractmethod
 from threading import Lock
@@ -61,6 +14,9 @@ from config.settings import (
     LOAD_BALANCER_ENABLE_METRICS_QUERY,
     REQUEST_TIMEOUT,
     LOAD_BALANCER_METRICS_LOG_INTERVAL,
+    LOAD_BALANCER_THRESHOLD_METRIC,     # e.g., "kv_cache_percent", "waiting", "total", "running"
+    LOAD_BALANCER_THRESHOLD_VALUE,      # e.g., 90.0, 10.0, etc.
+    LOAD_BALANCER_FALLBACK_STRATEGY,    # e.g., "least-total-load"
 )
 
 from routing.process_table import PROCESS_TABLE
@@ -163,6 +119,33 @@ class LeastWaitingStrategy(LoadBalancerStrategy):
 
         return best_engine
 
+class LeastRunningStrategy(LoadBalancerStrategy):
+    """
+    Select engine with minimum running requests.
+    """
+
+    async def select_engine(
+        self,
+        program_id: Optional[str],
+        num_input_tokens: int,
+        metrics: Dict[str, Dict],
+    ) -> str:
+
+        if not metrics:
+            return random.choice(ALL_BACKENDS)
+
+        best_engine = None
+        best_running = float("inf")
+
+        for engine, m in metrics.items():
+            running = int(m.get("running", 0))
+
+            if running < best_running:
+                best_running = running
+                best_engine = engine
+
+        return best_engine
+
 class LeastKVCacheStrategy(LoadBalancerStrategy):
     """
     Select engine with lowest KV cache usage.
@@ -245,67 +228,13 @@ class AutelixStrategy(LoadBalancerStrategy):
         return random.choice(candidates)
 
 
-
-class KVCacheAwareStrategy(LoadBalancerStrategy):
+class ThresholdAutellixStrategy(LoadBalancerStrategy):
     """
-    Route to engine with the lowest KV-cache utilization for short requests.
-    Long requests are pinned per-program similar to AutellixStrategy.
-    """
-
-    def __init__(self, short_request_threshold: int = 2048):
-        self.lock = Lock()
-        self.short_request_threshold = short_request_threshold
-
-    async def select_engine(
-        self, program_id: Optional[str], num_input_tokens: int, metrics: Dict[str, Dict]
-    ) -> str:
-
-        if num_input_tokens <= self.short_request_threshold:
-            return self._select_by_kv_cache(metrics)
-
-        if program_id:
-            proc = PROCESS_TABLE.get_process(program_id)
-            if proc and proc.get("preferred_engine"):
-                return proc["preferred_engine"]
-
-        return self._select_by_kv_cache(metrics)
-
-    async def on_program_complete(self, program_id: str):
-        PROCESS_TABLE.clear_preferred_engine(program_id)
-
-    def _select_by_kv_cache(self, metrics: Dict[str, Dict]) -> str:
-        if not metrics:
-            return ALL_BACKENDS[0] if ALL_BACKENDS else "http://localhost:8005"
-        best_engine = None
-        best_val = float("inf")
-        for engine, m in metrics.items():
-            kv = m.get("kv_cache_percent")
-            if kv is None:
-                # try to find any kv-like key
-                for k in m.keys():
-                    lk = k.lower()
-                    if "kv" in lk and "cache" in lk:
-                        try:
-                            kv = float(m[k])
-                        except Exception:
-                            kv = None
-                        break
-            try:
-                val = float(kv) if kv is not None else float("inf")
-            except Exception:
-                val = float("inf")
-            if val < best_val:
-                best_val = val
-                best_engine = engine
-        return best_engine or list(metrics.keys())[0]
-
-class KVThresholdAutellixStrategy(LoadBalancerStrategy):
-    """
-    Autellix-style with KV-cache safety valve.
+    Autellix-style with a generalized safety valve threshold.
 
     Long requests:
       - prefer pinned engine
-      - if KV cache > threshold → fallback strategy
+      - if targeted metric > threshold -> fallback strategy
 
     Short requests:
       - fallback strategy
@@ -314,11 +243,13 @@ class KVThresholdAutellixStrategy(LoadBalancerStrategy):
     def __init__(
         self,
         short_request_threshold: int,
-        kv_threshold_percent: float,
+        threshold_metric: str,
+        threshold_value: float,
         fallback_strategy: LoadBalancerStrategy,
     ):
         self.short_request_threshold = short_request_threshold
-        self.kv_threshold_percent = kv_threshold_percent
+        self.threshold_metric = threshold_metric
+        self.threshold_value = threshold_value
         self.fallback = fallback_strategy
 
     async def select_engine(
@@ -340,17 +271,25 @@ class KVThresholdAutellixStrategy(LoadBalancerStrategy):
             pinned = proc.get("preferred_engine") if proc else None
 
             if pinned and pinned in metrics:
-                kv = metrics[pinned].get("kv_cache_percent")
-                try:
-                    kv_val = float(kv)
-                except Exception:
-                    kv_val = None
+                m = metrics[pinned]
+                
+                # Special aggregation case for "total"
+                if self.threshold_metric == "total":
+                    running = int(m.get("running", 0))
+                    waiting = int(m.get("waiting", 0))
+                    metric_val = float(running + waiting)
+                else:
+                    val = m.get(self.threshold_metric)
+                    try:
+                        metric_val = float(val) if val is not None else None
+                    except Exception:
+                        metric_val = None
 
-                # KV OK → use pinned
-                if kv_val is None or kv_val < self.kv_threshold_percent:
+                # Metric OK → use pinned
+                if metric_val is None or metric_val < self.threshold_value:
                     return pinned
 
-                # KV too high → fallback
+                # Metric too high → fallback
                 return await self.fallback.select_engine(
                     program_id, num_input_tokens, metrics
                 )
@@ -363,7 +302,6 @@ class KVThresholdAutellixStrategy(LoadBalancerStrategy):
     async def on_program_complete(self, program_id: str):
         PROCESS_TABLE.clear_preferred_engine(program_id)
 
-
 class LoadBalancer:
     """Coordinator: metrics collection, logging and strategy dispatch."""
 
@@ -374,11 +312,26 @@ class LoadBalancer:
         self.last_metrics_log = 0.0
         self.metrics_query_task: Optional[asyncio.Task] = None
 
+    def _get_fallback_strategy(self, fallback_name: str) -> LoadBalancerStrategy:
+        """Helper to instantiate the chosen fallback strategy."""
+        name = fallback_name.lower() if fallback_name else "least-total-load"
+        if name == "round-robin":
+            return RoundRobinStrategy()
+        if name == "least-waiting":
+            return LeastWaitingStrategy()
+        if name == "least-running":
+            return LeastRunningStrategy()
+        if name == "least-kv-cache":
+            return LeastKVCacheStrategy()
+        
+        # default fallback
+        return LeastTotalLoadStrategy()
+
     def _init_strategy(self) -> LoadBalancerStrategy:
         name = (LOAD_BALANCER_STRATEGY or "autellix").lower()
 
         # ------------------------
-        # Baselines simples
+        # Simple Baselines
         # ------------------------
         if name == "round-robin":
             return RoundRobinStrategy()
@@ -388,37 +341,42 @@ class LoadBalancer:
 
         if name == "least-waiting":
             return LeastWaitingStrategy()
+            
+        if name == "least-running":
+            return LeastRunningStrategy()
 
         if name == "least-kv-cache":
             return LeastKVCacheStrategy()
 
         # ------------------------
-        # Autellix original
+        # Original Autellix
         # ------------------------
         if name == "autellix":
             return AutelixStrategy(LOAD_BALANCER_SHORT_REQUEST_THRESHOLD)
 
         # ------------------------
-        # KV-aware simples (já existente)
+        # General Threshold Autellix 
         # ------------------------
-        if name == "kv-cache":
-            return KVCacheAwareStrategy(LOAD_BALANCER_SHORT_REQUEST_THRESHOLD)
+        if name in ["threshold-autellix", "kv-threshold-autellix"]:
+            
+            # Fetch from config, or provide safe defaults
+            metric = getattr(LOAD_BALANCER_THRESHOLD_METRIC, "lower", lambda: "kv_cache_percent")()
+            try:
+                value = float(LOAD_BALANCER_THRESHOLD_VALUE)
+            except (ValueError, TypeError):
+                value = 90.0
+                
+            fallback_strat = self._get_fallback_strategy(LOAD_BALANCER_FALLBACK_STRATEGY)
 
-        # ------------------------
-        # Autellix + KV threshold (fallback modular)
-        # ------------------------
-        if name == "kv-threshold-autellix":
-            # fallback pode ser trocado facilmente
-            fallback = LeastTotalLoadStrategy() #por enquanto esta hardcoded, mas da para trocar pelas outras estrategias de escalonamento definidas
-
-            return KVThresholdAutellixStrategy(
+            return ThresholdAutellixStrategy(
                 short_request_threshold=LOAD_BALANCER_SHORT_REQUEST_THRESHOLD,
-                kv_threshold_percent=90.0,
-                fallback_strategy=fallback,
+                threshold_metric=metric,
+                threshold_value=value,
+                fallback_strategy=fallback_strat,
             )
 
         # ------------------------
-        # Default seguro
+        # Safe Default
         # ------------------------
         return AutelixStrategy(LOAD_BALANCER_SHORT_REQUEST_THRESHOLD)
 

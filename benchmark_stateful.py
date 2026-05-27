@@ -3,11 +3,16 @@ import time
 import asyncio
 from dataclasses import dataclass
 from typing import List, Dict, Any, Tuple
-
 import aiohttp
 import numpy as np
 from transformers import AutoTokenizer
 from tqdm import tqdm
+import argparse
+import os
+from typing import Literal
+import re
+import glob
+
 REQUEST_SEND_TIMES = []
 REQUEST_SEND_LOCK = asyncio.Lock()
 
@@ -277,8 +282,6 @@ def summarize_full(prog: ProgramMetrics) -> Dict[str, Any]:
 # HTTP request logic (returns metrics AND output text)
 # ============================================================
 
-from typing import Literal
-
 
 async def send_request(
     session: aiohttp.ClientSession,
@@ -292,7 +295,7 @@ async def send_request(
     temperature: float,
     prompt: str | None = None,
     messages: List[Dict[str, str]] | None = None,
-) -> Tuple[RequestMetrics, str]:
+    ) -> Tuple[RequestMetrics, str]:
 
     if mode == "completion":
         url = f"{base_url}/{program_id}/v1/completions"
@@ -390,6 +393,10 @@ async def send_request(
 # Stateful request wrapper
 # ============================================================
 
+# ============================================================
+# Stateful request wrapper with sliding context window trimming
+# ============================================================
+
 async def send_stateful_request(
     session,
     base_url,
@@ -402,28 +409,10 @@ async def send_stateful_request(
     conversation_state: dict,
     max_tokens=100,
     temperature=0.0,
-):
-
-    if mode == "completion":
-        history = conversation_state.get(program_id, "")
-        prompt = new_user_message if history == "" else history + "\n\n" + new_user_message
-
-        rm, text = await send_request(
-            session=session,
-            base_url=base_url,
-            program_id=program_id,
-            mode=mode,
-            model_name=model_name,
-            tokenizer=tokenizer,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-
-        conversation_state[program_id] = prompt + "\n\n" + text
-        # print(text)
-        return rm
-
+    ):
+    # Setup your model's maximum limit (matching your 40k max-model-len in vLLM)
+    CONTEXT_WINDOW_LIMIT = 40000
+    budget = CONTEXT_WINDOW_LIMIT - max_tokens
     # ---------------------------
     # CHAT MODE
     # ---------------------------
@@ -432,6 +421,23 @@ async def send_stateful_request(
     messages = history + [
         {"role": "user", "content": new_user_message}
     ]
+
+    # Dynamically pop oldest messages until the formatted chat structure fits the budget
+    while len(messages) > 1:
+        try:
+            # apply_chat_template accurately counts formatting tags (<|im_start|>, etc.)
+            token_ids = tokenizer.apply_chat_template(messages, tokenize=True)
+            num_tokens = len(token_ids)
+        except Exception:
+            # Fallback text estimation if template processing fails
+            combined_text = "\n".join(m["content"] for m in messages)
+            num_tokens = len(tokenizer(combined_text, add_special_tokens=False).input_ids)
+
+        if num_tokens <= budget:
+            break
+        
+        # Pop the oldest message (turn) out of the history context
+        messages.pop(0)
 
     rm, text = await send_request(
         session=session,
@@ -447,17 +453,12 @@ async def send_stateful_request(
 
     messages.append({"role": "assistant", "content": text})
     conversation_state[program_id] = messages
-    # print(text)
     return rm
-
 
 
 # ============================================================
 # Benchmark orchestration
 # ============================================================
-import numpy as np
-import asyncio
-import time
 
 
 class RateLimiter:
@@ -551,14 +552,11 @@ async def run_programs(
             req_metrics: List[RequestMetrics] = []
             conversation_state = {}
 
+            await rate_limiter.acquire()
+
             for new_message in prompts:
 
-                # ----------------------------
-                # Arrival control (GLOBAL)
-                # ----------------------------
-                await rate_limiter.acquire()
-
-                # Arrival timestamp for validation
+                # Arrival timestamp for validation (Mantido aqui para marcar a hora exata do envio)
                 async with REQUEST_SEND_LOCK:
                     REQUEST_SEND_TIMES.append(time.perf_counter())
 
@@ -728,52 +726,71 @@ async def benchmark_sharegpt(
 
     return per_program_metrics, full_metrics, latency_separation, full_latency_separation
 
-import os
-import json
-import re
-import glob
+
 
 def get_baseline_metrics(output_json_path):
     """
-    Recebe:
-        output_${scheduler}_${strategy}_rate${rate}_run${RUN}.json
+    Recebe o caminho de saída, ex:
+        output_plas_kv_token_time_least-total-load_rate4_run1.json
+        output_fcfs_least-waiting_rate10_run2.json
 
-    Encontra automaticamente todos os:
-        baseline_output_{scheduler}_round-robin_rate{rate}_run*.json
-
-    E retorna a média das métricas.
+    Encontra automaticamente o respectivo baseline:
+        baseline_output_plas_kv_token_time_round-robin_rate4_run*.json
+        baseline_output_fcfs_round-robin_rate10_run*.json
     """
-
-    # --------------------------------------------------
-    # 1) Extrair scheduler e rate do nome do arquivo
-    # --------------------------------------------------
     filename = os.path.basename(output_json_path)
 
-    match = re.search(r"output_([^_]+)_.+_rate(\d+)_run\d+\.json", filename)
-    if not match:
-        raise ValueError(f"Nome de arquivo inesperado: {filename}")
-
-    scheduler = match.group(1)
-    rate = match.group(2)
+    # --------------------------------------------------
+    # 1) Extrair o sched_suffix correto
+    # --------------------------------------------------
+    sched_suffix = None
+    
+    # Lista de prefixos conhecidos baseada no seu script Bash
+    known_suffixes = ["fcfs", "plas_service_ewma", "plas_kv_token_time"]
+    
+    for suffix in known_suffixes:
+        if filename.startswith(f"output_{suffix}_"):
+            sched_suffix = suffix
+            break
+            
+    # Fallback genérico caso adicione um scheduler simples (sem underline) no futuro
+    if not sched_suffix:
+        match_generic = re.search(r"output_([^_]+)_.+_rate", filename)
+        if match_generic:
+            sched_suffix = match_generic.group(1)
+        else:
+            raise ValueError(f"Não foi possível determinar o scheduler do arquivo: {filename}")
 
     # --------------------------------------------------
-    # 2) Procurar baselines correspondentes
+    # 2) Extrair a taxa (rate)
+    # --------------------------------------------------
+    rate_match = re.search(r"_rate(\d+)_run", filename)
+    if not rate_match:
+        raise ValueError(f"Não foi possível encontrar a taxa (rate) no arquivo: {filename}")
+    
+    rate = rate_match.group(1)
+
+    # --------------------------------------------------
+    # 3) Procurar o baseline exato correspondente
     # --------------------------------------------------
     base_dir = os.path.dirname(output_json_path)
-
+    
+    # Agora o pattern busca o prefixo composto exato (ex: plas_kv_token_time)
     pattern = os.path.join(
         base_dir,
-        f"baseline_output_{scheduler}_round-robin_rate{rate}_run*.json"
+        f"baseline_output_{sched_suffix}_round-robin_rate{rate}_run*.json"
     )
 
     files = glob.glob(pattern)
 
     if len(files) == 0:
         raise ValueError(
-            f"Nenhum baseline encontrado para scheduler={scheduler}, rate={rate}"
+            f"Nenhum baseline encontrado para sched_suffix={sched_suffix}, rate={rate}.\n"
+            f"Padrão buscado: {pattern}"
         )
+
     # --------------------------------------------------
-    # 4) Agregar métricas
+    # 4) Agregar métricas dos baselines encontrados
     # --------------------------------------------------
     median_e2el_ms = 0
     p75_e2el_ms = 0
@@ -791,7 +808,6 @@ def get_baseline_metrics(output_json_path):
             p95_e2el_ms += data["full_metrics"]["p95_e2el_ms"]
             p99_e2el_ms += data["full_metrics"]["p99_e2el_ms"]
 
-
     count = len(files)
 
     median_e2el_ms /= count
@@ -801,11 +817,11 @@ def get_baseline_metrics(output_json_path):
     p99_e2el_ms /= count
 
     return {
-        50: median_e2el_ms/1000,
-        75: p75_e2el_ms/1000,
-        90: p90_e2el_ms/1000,
-        95: p95_e2el_ms/1000,
-        99: p99_e2el_ms/1000,
+        50: median_e2el_ms / 1000,
+        75: p75_e2el_ms / 1000,
+        90: p90_e2el_ms / 1000,
+        95: p95_e2el_ms / 1000,
+        99: p99_e2el_ms / 1000,
     }
 
 
@@ -814,8 +830,7 @@ def get_baseline_metrics(output_json_path):
 # ============================================================
 
 if __name__ == "__main__":
-    import argparse
-    import os
+
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", required=True)
