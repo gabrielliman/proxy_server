@@ -1,12 +1,10 @@
-import asyncio
 import random
+import asyncio
 import time
+import httpx
 from abc import ABC, abstractmethod
 from threading import Lock
-from typing import Dict, Optional
-
-import httpx
-
+from typing import Dict, Optional, List
 from config.settings import (
     ALL_BACKENDS,
     LOAD_BALANCER_SHORT_REQUEST_THRESHOLD,
@@ -20,81 +18,161 @@ from config.settings import (
 )
 
 from routing.process_table import PROCESS_TABLE
-
-
+    
 class LoadBalancerStrategy(ABC):
-    """Abstract base class for load balancing strategies."""
-
+    """Classe base abstrata. Todas as estratégias DEVEM aceitar 'candidates'."""
     @abstractmethod
     async def select_engine(
-        self, program_id: Optional[str], num_input_tokens: int, metrics: Dict[str, Dict]
+        self, 
+        program_id: Optional[str], 
+        num_input_tokens: int, 
+        metrics: Dict[str, Dict], 
+        candidates: List[str] = None
     ) -> str:
         pass
 
     async def on_program_complete(self, program_id: str):
         pass
 
-    async def on_call_complete(self, program_id: str, engine_id: str):
-        pass
-
-
+# --- ESTRATÉGIAS ---
+    
 class RoundRobinStrategy(LoadBalancerStrategy):
-    """
-    Simple round-robin load balancing across ALL_BACKENDS.
-    Ignores metrics and distributes requests evenly.
-    """
-
     def __init__(self):
         self._idx = 0
         self._lock = Lock()
 
-    async def select_engine(
-        self,
-        program_id: Optional[str],
-        num_input_tokens: int,
-        metrics: Dict[str, Dict],
-    ) -> str:
-        if not ALL_BACKENDS:
-            raise RuntimeError("No backends configured for load balancer")
-
+    async def select_engine(self, program_id, num_input_tokens, metrics, candidates=None) -> str:
+        # Se não houver candidatos específicos, usa todos os backends
+        targets = candidates if candidates else ALL_BACKENDS
+        if not targets:
+            raise RuntimeError("Nenhum backend disponível.")
         with self._lock:
-            engine = ALL_BACKENDS[self._idx % len(ALL_BACKENDS)]
+            engine = targets[self._idx % len(targets)]
             self._idx += 1
-
         return engine
-        
+
 class LeastTotalLoadStrategy(LoadBalancerStrategy):
-    """
-    Select engine with minimum (running + waiting).
-    """
+    async def select_engine(self, program_id, num_input_tokens, metrics, candidates=None) -> str:
+        # Filtra métricas apenas para os modelos compatíveis
+        target_metrics = {u: m for u, m in metrics.items() if candidates is None or u in candidates}
+        if not target_metrics:
+            return random.choice(candidates) if candidates else random.choice(ALL_BACKENDS)
 
-    async def select_engine(
-        self,
-        program_id: Optional[str],
-        num_input_tokens: int,
-        metrics: Dict[str, Dict],
-    ) -> str:
-
-        if not metrics:
-            return random.choice(ALL_BACKENDS)
-
-        best_engine = None
-        best_load = float("inf")
-
-        for engine, m in metrics.items():
-            running = int(m.get("running", 0))
-            waiting = int(m.get("waiting", 0))
-            total = running + waiting
-
-            if total < best_load:
-                best_load = total
-                best_engine = engine
-
+        best_engine = min(target_metrics.keys(), 
+                         key=lambda e: int(target_metrics[e].get("running", 0)) + int(target_metrics[e].get("waiting", 0)))
         return best_engine
 
+class AutelixStrategy(LoadBalancerStrategy):
+    """Estratégia Autellix: Curto -> Carga; Longo -> Afinidade."""
+    def __init__(self, short_threshold: int = 2048):
+        self.short_threshold = short_threshold
+
+    async def select_engine(self, program_id, num_input_tokens, metrics, candidates=None) -> str:
+        target_metrics = {u: m for u, m in metrics.items() if candidates is None or u in candidates}
+        
+        if not target_metrics:
+            return random.choice(candidates) if candidates else random.choice(ALL_BACKENDS)
+
+        # SE REQUISIÇÃO CURTA: Menor carga entre os candidatos
+        if num_input_tokens <= self.short_threshold:
+            return self._select_least_used(target_metrics)
+
+        # SE REQUISIÇÃO LONGA: Tenta afinidade (Data Locality)
+        if program_id:
+            proc = PROCESS_TABLE.get_process(program_id)
+            pref = proc.get("preferred_engine") if proc else None
+            if pref and (candidates is None or pref in candidates):
+                return pref
+
+        return self._select_least_used(target_metrics)
+
+    def _select_least_used(self, metrics: Dict[str, Dict]) -> str:
+        # Usa local_active_requests da PROCESS_TABLE para maior precisão
+        return min(metrics.keys(), key=lambda e: int(metrics[e].get("local_active_requests", 0)))
+
+class KVCacheAwareStrategy(LoadBalancerStrategy):
+    """
+    Roteia para a engine com menor uso de KV-cache para requisições curtas.
+    Requisições longas são fixadas por programa (afinidade), respeitando os candidatos.
+    """
+
+    def __init__(self, short_request_threshold: int = 2048):
+        self.lock = Lock()
+        self.short_request_threshold = short_request_threshold
+
+    async def select_engine(
+        self, 
+        program_id: Optional[str], 
+        num_input_tokens: int, 
+        metrics: Dict[str, Dict],
+        candidates: List[str] = None  # <--- Adicionado para consistência
+    ) -> str:
+
+        # 1. Filtra as métricas para considerar apenas backends que possuem o modelo solicitado
+        target_metrics = {
+            url: m for url, m in metrics.items() 
+            if candidates is None or url in candidates
+        }
+
+        if not target_metrics:
+            # Fallback: escolhe aleatoriamente entre os candidatos válidos
+            return random.choice(candidates) if candidates else random.choice(ALL_BACKENDS)
+
+        # 2. Lógica para Requisições Curtas: Usa o KV-cache como critério
+        if num_input_tokens <= self.short_request_threshold:
+            return self._select_by_kv_cache(target_metrics)
+
+        # 3. Lógica para Requisições Longas: Tenta afinidade (Data Locality)
+        if program_id:
+            from routing.process_table import PROCESS_TABLE
+            proc = PROCESS_TABLE.get_process(program_id)
+            if proc and proc.get("preferred_engine"):
+                pref = proc["preferred_engine"]
+                # Só utiliza a preferida se ela for compatível com o modelo (estiver nos candidatos)
+                if candidates is None or pref in candidates:
+                    return pref
+
+        return self._select_by_kv_cache(target_metrics)
+
+    async def on_program_complete(self, program_id: str):
+        from routing.process_table import PROCESS_TABLE
+        PROCESS_TABLE.clear_preferred_engine(program_id)
+
+    def _select_by_kv_cache(self, metrics: Dict[str, Dict]) -> str:
+        # Busca a engine com menor uso entre as métricas já filtradas
+        if not metrics:
+            return random.choice(ALL_BACKENDS)
+            
+        best_engine = None
+        best_val = float("inf")
+        
+        for engine, m in metrics.items():
+            # Busca o valor de KV cache (vLLM reporta como 'kv_cache_percent')
+            kv = m.get("kv_cache_percent")
+            
+            # Tenta encontrar chaves similares se a principal não existir
+            if kv is None:
+                for k, v in m.items():
+                    if "kv" in k.lower() and "cache" in k.lower():
+                        try:
+                            kv = float(v)
+                            break
+                        except: continue
+            try:
+                val = float(kv) if kv is not None else float("inf")
+            except:
+                val = float("inf")
+
+            if val < best_val:
+                best_val = val
+                best_engine = engine
+                
+        return best_engine or list(metrics.keys())[0]
+    
 class LeastWaitingStrategy(LoadBalancerStrategy):
     """
-    Select engine with minimum waiting requests.
+    Seleciona a engine com o menor número de requisições na fila (waiting).
+    Agora com suporte a filtragem de modelos (candidates).
     """
 
     async def select_engine(
@@ -102,15 +180,25 @@ class LeastWaitingStrategy(LoadBalancerStrategy):
         program_id: Optional[str],
         num_input_tokens: int,
         metrics: Dict[str, Dict],
+        candidates: List[str] = None  # <--- Adicionado para consistência
     ) -> str:
 
-        if not metrics:
-            return random.choice(ALL_BACKENDS)
+        # 1. Filtra as métricas para considerar apenas os backends que possuem o modelo
+        target_metrics = {
+            url: m for url, m in metrics.items() 
+            if candidates is None or url in candidates
+        }
+
+        if not target_metrics:
+            # Fallback seguro: se não houver métricas, escolhe um dos candidatos válidos
+            return random.choice(candidates) if candidates else random.choice(ALL_BACKENDS)
 
         best_engine = None
         best_waiting = float("inf")
 
-        for engine, m in metrics.items():
+        # 2. Busca o menor 'waiting' apenas entre os modelos compatíveis
+        for engine, m in target_metrics.items():
+            # Tenta obter 'waiting' das métricas do vLLM ou 0 se não disponível
             waiting = int(m.get("waiting", 0))
 
             if waiting < best_waiting:
@@ -148,7 +236,8 @@ class LeastRunningStrategy(LoadBalancerStrategy):
 
 class LeastKVCacheStrategy(LoadBalancerStrategy):
     """
-    Select engine with lowest KV cache usage.
+    Seleciona a engine com o menor uso de KV cache.
+    Essencial para evitar fragmentação de memória em contextos longos (20k).
     """
 
     async def select_engine(
@@ -156,18 +245,29 @@ class LeastKVCacheStrategy(LoadBalancerStrategy):
         program_id: Optional[str],
         num_input_tokens: int,
         metrics: Dict[str, Dict],
+        candidates: List[str] = None  # <--- Parâmetro obrigatório para consistência
     ) -> str:
 
-        if not metrics:
-            return random.choice(ALL_BACKENDS)
+        # 1. Filtramos as métricas para considerar apenas as portas compatíveis com o modelo
+        target_metrics = {
+            url: m for url, m in metrics.items() 
+            if candidates is None or url in candidates
+        }
+
+        if not target_metrics:
+            # Fallback: escolhe um candidato válido aleatoriamente se não houver métricas
+            return random.choice(candidates) if candidates else random.choice(ALL_BACKENDS)
 
         best_engine = None
         best_kv = float("inf")
 
-        for engine, m in metrics.items():
-            kv = m.get("kv_cache_percent")
+        # 2. Busca o menor uso de KV Cache apenas entre os candidatos válidos
+        for engine, m in target_metrics.items():
+            # vLLM reporta como 'kv_cache_percent' ou 'kv_cache_usage_perc'
+            kv = m.get("kv_cache_percent") or m.get("kv_cache_usage_perc")
+            
             try:
-                kv_val = float(kv)
+                kv_val = float(kv) if kv is not None else float("inf")
             except Exception:
                 kv_val = float("inf")
 
@@ -257,50 +357,51 @@ class ThresholdAutellixStrategy(LoadBalancerStrategy):
         program_id: Optional[str],
         num_input_tokens: int,
         metrics: Dict[str, Dict],
+        candidates: List[str] = None  # <--- Adicionado para consistência modular
     ) -> str:
 
-        # SHORT REQUEST → fallback
+        # REQUISIÇÃO CURTA → utiliza a estratégia de recuo (fallback) com os candidatos
         if num_input_tokens <= self.short_request_threshold:
             return await self.fallback.select_engine(
-                program_id, num_input_tokens, metrics
+                program_id, num_input_tokens, metrics, candidates=candidates
             )
 
-        # LONG REQUEST → try pinned engine
+        # REQUISIÇÃO LONGA → tenta usar a engine fixada (affinity)
         if program_id:
+            from routing.process_table import PROCESS_TABLE
             proc = PROCESS_TABLE.get_process(program_id)
             pinned = proc.get("preferred_engine") if proc else None
 
-            if pinned and pinned in metrics:
-                m = metrics[pinned]
-                
-                # Special aggregation case for "total"
-                if self.threshold_metric == "total":
-                    running = int(m.get("running", 0))
-                    waiting = int(m.get("waiting", 0))
-                    metric_val = float(running + waiting)
-                else:
-                    val = m.get(self.threshold_metric)
-                    try:
-                        metric_val = float(val) if val is not None else None
-                    except Exception:
-                        metric_val = None
+            # Verifica se a engine fixada é compatível com o modelo atual
+            is_valid_candidate = candidates is None or pinned in candidates
 
-                # Metric OK → use pinned
-                if metric_val is None or metric_val < self.threshold_value:
+            if pinned and pinned in metrics and is_valid_candidate:
+                kv = metrics[pinned].get("kv_cache_percent")
+                try:
+                    kv_val = float(kv)
+                except Exception:
+                    kv_val = None
+
+                # SE O CACHE ESTIVER OK → mantém na engine fixada
+                if kv_val is None or kv_val < self.kv_threshold_percent:
                     return pinned
 
-                # Metric too high → fallback
+                # SE O CACHE ESTIVER MUITO ALTO → usa o fallback para achar outra engine válida
+                print(f"⚠️ [LB] KV Cache alto ({kv_val}%). Acionando fallback para {program_id}")
                 return await self.fallback.select_engine(
-                    program_id, num_input_tokens, metrics
+                    program_id, num_input_tokens, metrics, candidates=candidates
                 )
 
-        # no pin → fallback
+        # Sem afinidade ou engine não compatível → vai para o fallback
         return await self.fallback.select_engine(
-            program_id, num_input_tokens, metrics
+            program_id, num_input_tokens, metrics, candidates=candidates
         )
 
     async def on_program_complete(self, program_id: str):
+        from routing.process_table import PROCESS_TABLE
         PROCESS_TABLE.clear_preferred_engine(program_id)
+
+# --- COORDENADOR (LOAD BALANCER) ---   
 
 class LoadBalancer:
     """Coordinator: metrics collection, logging and strategy dispatch."""
@@ -309,7 +410,7 @@ class LoadBalancer:
         self.strategy: LoadBalancerStrategy = self._init_strategy()
         self.metrics_cache: Dict[str, Dict] = {engine: {} for engine in ALL_BACKENDS}
         self.metrics_lock = Lock()
-        self.last_metrics_log = 0.0
+        self.last_metricstmux_log = 0.0
         self.metrics_query_task: Optional[asyncio.Task] = None
 
     def _get_fallback_strategy(self, fallback_name: str) -> LoadBalancerStrategy:
@@ -382,9 +483,19 @@ class LoadBalancer:
 
 
       
-    async def select_engine(self, program_id: Optional[str], num_input_tokens: int) -> str:
+    async def select_engine(
+            self, 
+            program_id: Optional[str], 
+            num_input_tokens: int,
+            candidates: List[str] = None,
+            ) -> str:
         metrics = self._get_cached_metrics()
-        return await self.strategy.select_engine(program_id, num_input_tokens, metrics)
+        return await self.strategy.select_engine(
+            program_id, 
+            num_input_tokens, 
+            metrics, 
+            candidates=candidates 
+        )
 
     
     async def on_program_complete(self, program_id: str):

@@ -11,9 +11,12 @@ import os
 # "casperhansen/llama-3-8b-instruct-awq"
 
 MODEL_ROUTES = {
-    "Qwen/Qwen2.5-14B-Instruct-AWQ": [
+    "meta-llama/Llama-3.1-8B-Instruct": [
         "http://localhost:8006"
     ],
+    # "Qwen/Qwen2.5-1.5B-Instruct": [
+    #     "http://localhost:8006"
+    # ],
 }
 
 #nao funciona para o endpoint completions
@@ -32,7 +35,7 @@ BACKEND_METRICS = {
 
 LOG_FILE = "proxy_metrics.csv"
 METRICS_INTERVAL = 1.0
-REQUEST_TIMEOUT = 300.0
+REQUEST_TIMEOUT = 36000.0
 METRICS_TIMEOUT = 1.5
 
 
@@ -48,20 +51,15 @@ PLAS_EWMA_ALPHA = 0.3
 PLAS_AGE_WEIGHT = 0.5
 PLAS_PRIORITY_BASE = 1.0
 
-# PLAS metric type: 'service_ewma' (default, LAS) or 'kv_token_time'
-# - service_ewma: Uses EWMA of actual service time (Least Attained Service)
-# - kv_token_time: Uses EWMA of KV token-time (d*c = pd + d²/2)
-PLAS_METRIC_TYPE = os.getenv("PLAS_METRIC_TYPE", "service_ewma")
-
 # Discretized priority queues for PLAS (Autellix-style)
 DISCRETIZED_PRIORITY_BUCKETS = 10  # K: number of priority levels
 DISCRETIZED_PRIORITY_BASE = PLAS_PRIORITY_BASE * 2  # span to discretize (adjust as needed)
 ANTI_STARVATION_RATIO_THRESHOLD = 0.5  # beta: W_total/T_total >= threshold triggers promotion to Q1
 
-LOAD_BALANCER_SHORT_REQUEST_THRESHOLD = int(os.getenv("LOAD_BALANCER_SHORT_REQUEST_THRESHOLD", 2048))
-
+LOAD_BALANCER_SHORT_REQUEST_THRESHOLD = 2048
 # Load balancer configuration
 LOAD_BALANCER_ENABLE = True
+LOAD_BALANCER_STRATEGY = os.getenv("LOAD_BALANCER_STRATEGY", "autellix")  # options: "autellix", "kv-cache"
 LOAD_BALANCER_METRICS_LOG_INTERVAL = 5  # seconds between human-readable logs
 LOAD_BALANCER_ENABLE_METRICS_QUERY = True  # query engine /metrics endpoints
 

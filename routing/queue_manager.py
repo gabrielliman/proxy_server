@@ -113,3 +113,31 @@ async def get_request(backend: str):
     else:
         # FCFS: plain asyncio.Queue.get()
         return await q.get()
+
+# NOVA FUNÇÃO 
+def clear_all_queues():
+    """Remove todos os itens de todas as filas de backend."""
+    global backend_queues
+    total_removed = 0
+
+    for backend, q in backend_queues.items():
+        # Caso 1: Scheduler PLAS (Múltiplas sub-filas)
+        if isinstance(q, DiscretizedQueueWrapper):
+            for sub_q in q.queues:
+                while not sub_q.empty():
+                    try:
+                        sub_q.get_nowait()
+                        total_removed += 1
+                    except asyncio.QueueEmpty:
+                        break
+        
+        # Caso 2: Scheduler FCFS (asyncio.Queue padrão)
+        elif isinstance(q, asyncio.Queue):
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                    total_removed += 1
+                except asyncio.QueueEmpty:
+                    break
+    
+    return total_removed

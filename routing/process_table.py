@@ -9,6 +9,72 @@ class ProcessTable:
         self.lock = Lock()
         self.table: Dict[str, Dict[str, Any]] = {}
         
+    #------------------------ REVISED -----------------------------------------#
+        self.active_tasks = {} 
+        
+    def is_call_pruned(self, program_id: str, call_id: str) -> bool:
+        """Verifica se a chamada foi podada. Agora pede PID e CID."""
+        with self.lock:
+            # Se não temos o PID, ou se o PID não está na tabela, 
+            # podemos fazer uma busca rápida (opcional, mas seguro)
+            entry = self.table.get(program_id)
+            if not entry:
+                return False
+                
+            th = entry["threads"].get(call_id)
+            if th:
+                # Verifica se o estado é erro e se o motivo foi PODA
+                return th.get("state") == "error" and "PRUNED" in str(th.get("error_type", ""))
+            
+            return False
+
+    def register_active_task(self, call_id, task):
+        """Registra a tarefa do worker para que possa ser cancelada depois."""
+        self.active_tasks[call_id] = task
+
+    def unregister_active_task(self, call_id):
+        """Remove a tarefa do registro após a conclusão ou erro."""
+        self.active_tasks.pop(call_id, None)
+
+    def get_active_task(self, call_id):
+        """Busca a tarefa ativa para o Endpoint dar o 'golpe de misericórdia'."""
+        return self.active_tasks.get(call_id)
+    
+        
+    def record_call_error(self, program_id: str, call_id: str, error_type: str):
+        """
+        Registra que uma chamada foi interrompida (TIE_PRUNED) ou falhou.
+        Alinhado com a estrutura de 'threads' do record_call_arrival.
+        """
+        with self.lock:
+            # 1. Verifica se o programa existe na tabela
+            if program_id not in self.table:
+                self.ensure_process(program_id) # Garante que a estrutura existe
+            
+            # 2. Acessa o dicionário de chamadas (threads)
+            entry = self.table[program_id]
+            if call_id in entry["threads"]:
+                entry["threads"][call_id] = {"arrival_time": time.time()}
+            call_data = entry["threads"][call_id]           
+            call_data["state"] = "error" 
+            call_data["error_type"] = error_type
+            call_data["completion_time"] = time.time() 
+                
+            print(f"❌ [PROCESS_TABLE] Call {call_id} marked as {error_type}")
+            
+    def increment_call_count(self, program_id: str) -> int:
+        """
+        Incrementa o contador de chamadas no início da requisição.
+        Isso garante que o Warm-up funcione mesmo se a chamada for podada depois.
+        """
+        self.ensure_process(program_id) # Garante que o dicionário existe
+        with self.lock:
+            entry = self.table[program_id]
+            entry["call_count"] += 1
+            return entry["call_count"]
+    
+    #--------------------------------------------------------------------------#
+    
     def ensure_process(self, program_id: str):
         with self.lock:
             if program_id not in self.table:
