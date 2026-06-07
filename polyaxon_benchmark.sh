@@ -1,5 +1,7 @@
 #!/bin/bash
 # START VLLM SERVERS
+export HF_TOKEN=""
+
 source /opt/conda/etc/profile.d/conda.sh && conda activate proxy_server
 set -x
 
@@ -8,8 +10,8 @@ set -x
 # ============================================================
 
 # Set the model name once
-MODEL_NAME="meta-llama/Llama-3.1-8B-Instruct"
-
+MODEL_NAME="meta-llama/Llama-3.3-70B-Instruct"
+MODEL_PATH="/scratch/hpc4ai/models/llama/Llama-3.3-70B-Instruct"
 # Define the ports as an array. Add or remove ports here to automatically scale.
 PORTS=(8105 8106)
 
@@ -45,13 +47,15 @@ for PORT in "${PORTS[@]}"; do
     echo "[INFO] Booting server on port $PORT..."
     
     # Your exact pipeline syntax
-    CUDA_VISIBLE_DEVICES=$GPU python -u -m vllm.entrypoints.openai.api_server \
-        --model "$MODEL_NAME" \
+    CUDA_VISIBLE_DEVICES=$GPU,$((GPU + 1)) python -u -m vllm.entrypoints.openai.api_server \
+        --model "$MODEL_PATH" \
         --port "$PORT" \
         --max-num-seqs "$MAX_NUM_SEQS" \
         --dtype bfloat16 \
         --max-model-len 40000 \
-        --gpu-memory-utilization 0.4 \
+        --gpu-memory-utilization 0.9 \
+        --served-model-name $MODEL_NAME \
+        --tensor_parallel_size 2
         2>&1 | tee "$LOG_DIR/saida_VLLM_${PORT}.txt" &
         
     # This executes exactly as: PID1=$!, PID2=$!, etc.
@@ -61,13 +65,15 @@ for PORT in "${PORTS[@]}"; do
     eval "echo '[INFO] Engine $PORT assigned to PID${ENGINE_IDX}=\$PID${ENGINE_IDX}'"
         
     wait_for_ready "$PORT"
-    # GPU=$((GPU + 1))
+    GPU=$((GPU + 2))
+
     ENGINE_IDX=$((ENGINE_IDX + 1))
 done
 # ============================================================
 # Benchmark Setup
 # ============================================================
 BASE_URL="http://localhost:8081"
+#trocar para local na scratch
 DATASET="./ShareGPT_V3_unfiltered_cleaned_split.json"
 
 if [ ! -f "$DATASET" ]; then
@@ -90,12 +96,13 @@ done
 # Experiment grid
 # ============================================================
 MODEL="$MODEL_NAME"
-LIMIT=1000
-OUTPUTS_DIR="outputs/program_arrivalrate"
+LIMIT=10
+OUTPUTS_DIR="outputs/teste_axia"
 mkdir -p "$OUTPUTS_DIR"
 CHAT_LEN=-1
 REPEATS=1
-RATES=("0.5" "1" "2" "4" "8")
+RATES=("8")
+# RATES=("0.5" "1" "2" "4" "8")
 BURSTINESS=1
 
 # Format: "scheduler_name:plas_metric_type"
@@ -108,13 +115,13 @@ SCHEDULER_CONFIGS=(
 # Format: "strategy_name:threshold_metric:threshold_value"
 LB_CONFIGS=(
   "least-total-load:N/A:0"
-  "least-waiting:N/A:0"
-  "least-running:N/A:0"
-  "least-kv-cache:N/A:0"
-  "autellix:N/A:0"
-  "threshold-autellix:total:15"
-  "threshold-autellix:running:10"
-  "threshold-autellix:kv_cache_percent:90"
+#   "least-waiting:N/A:0"
+#   "least-running:N/A:0"
+#   "least-kv-cache:N/A:0"
+#   "autellix:N/A:0"
+#   "threshold-autellix:total:15"
+#   "threshold-autellix:running:10"
+#   "threshold-autellix:kv_cache_percent:90"
 )
 
 # ============================================================

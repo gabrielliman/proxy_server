@@ -1,17 +1,25 @@
 import os
+from dotenv import load_dotenv
 
-#CONFIGURE AQUI
-MODEL= "meta-llama/Llama-3.1-8B-Instruct"
+load_dotenv()
+
+# CONFIGURE AQUI
+HF_TOKEN = os.getenv("HF_TOKEN")
+MODEL ="meta-llama/Llama-3.3-70B-Instruct"
 MODEL_ROUTES = {
     # "Qwen/Qwen3-4B": [
     #     "http://localhost:8105",
     #     # "http://localhost:8105"
     # ],
     
-    "meta-llama/Llama-3.1-8B-Instruct": [
+    # "meta-llama/Llama-3.1-8B-Instruct": [
+    #     "http://localhost:8105",
+    #     "http://localhost:8106"
+    # ],
+    "meta-llama/Llama-3.3-70B-Instruct": [
         "http://localhost:8105",
-        # "http://localhost:8106"
-    ],
+        "http://localhost:8106"
+    ]
 }
 
 #nao funciona para o endpoint completions

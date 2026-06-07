@@ -1,9 +1,10 @@
 #!/bin/bash
-set -e
-export HF_HOME="/scratch/global/huggingface_cache/huggingface"
+set -a
+source "/mnt/scratch/scheduler/proxy_server/.env"
+export HF_HOME="/mnt/scratch/global/huggingface_cache/huggingface"
 
 # Paths and ports
-MODEL1_NAME="meta-llama/Llama-3.1-8B-Instruct"
+MODEL1_NAME="/mnt/scratch/global/huggingface_cache/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659"
 MODEL2_NAME="meta-llama/Llama-3.1-8B-Instruct"
 # MODEL3_NAME="meta-llama/Llama-3.1-8B-Instruct"
 # "meta-llama/Llama-3.1-8B-Instruct"
@@ -21,10 +22,10 @@ MODEL2_PORT=8106
 MODEL1_MAX_NUM_SEQS=10
 MODEL2_MAX_NUM_SEQS=10
 
-LOG_DIR="/scratch/global/proxy_server/var/logs"
+LOG_DIR="/mnt/scratch/scheduler/proxy_server/var/logs"
 
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate /scratch/global/abacus
+source /opt/miniconda/etc/profile.d/conda.sh
+conda activate /mnt/scratch/scheduler/envs/proxy_server
 
 
 wait_for_ready() {

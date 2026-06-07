@@ -11,3 +11,5 @@ benchmark_results.json
 var/logs/*
 *.pt
 start_vllm.sh
+*.env
+.env
