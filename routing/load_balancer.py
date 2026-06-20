@@ -3,12 +3,13 @@ import random
 import time
 from abc import ABC, abstractmethod
 from threading import Lock
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 
 import httpx
 
 from config.settings import (
     ALL_BACKENDS,
+    BACKEND_PARALLELISM,
     LOAD_BALANCER_SHORT_REQUEST_THRESHOLD,
     LOAD_BALANCER_STRATEGY,
     LOAD_BALANCER_ENABLE_METRICS_QUERY,
@@ -198,8 +199,9 @@ class AutelixStrategy(LoadBalancerStrategy):
         # LONG REQUEST → data locality
         if program_id:
             proc = PROCESS_TABLE.get_process(program_id)
-            if proc and proc.get("preferred_engine"):
-                return proc["preferred_engine"]
+            preferred = proc.get("preferred_engines") if proc else None
+            if preferred and len(preferred) > 0:
+                return preferred[0]
 
         engine = self._select_least_used(metrics)
         print("LB SELECT_ENGINE CALLED", program_id, num_input_tokens)
@@ -268,7 +270,8 @@ class ThresholdAutellixStrategy(LoadBalancerStrategy):
         # LONG REQUEST → try pinned engine
         if program_id:
             proc = PROCESS_TABLE.get_process(program_id)
-            pinned = proc.get("preferred_engine") if proc else None
+            preferred = proc.get("preferred_engines") if proc else None
+            pinned = preferred[0] if preferred and len(preferred) > 0 else None
 
             if pinned and pinned in metrics:
                 m = metrics[pinned]
@@ -301,6 +304,259 @@ class ThresholdAutellixStrategy(LoadBalancerStrategy):
 
     async def on_program_complete(self, program_id: str):
         PROCESS_TABLE.clear_preferred_engine(program_id)
+
+class BaseDynamicAutellixStrategy(LoadBalancerStrategy):
+    """Classe base contendo a lógica compartilhada para Autellix Dinâmico."""
+    
+    def __init__(self, short_request_threshold: int = 2048):
+        self.short_request_threshold = short_request_threshold
+        self.lock = Lock()
+
+    def _is_engine_full(self, engine: str, metrics: Dict[str, Dict]) -> bool:
+        """Verifica se a engine atingiu seu limite de BACKEND_PARALLELISM."""
+        m = metrics.get(engine, {})
+        # Usamos local_active_requests (running + waiting) como proxy de ocupação
+        load = int(m.get("local_active_requests", 0))
+        capacity = BACKEND_PARALLELISM.get(engine) # 10 é fallback de segurança
+        return load >= capacity
+
+    def _select_least_used_global(self, metrics: Dict[str, Dict]) -> str:
+        """Seleciona a engine mais ociosa do cluster inteiro."""
+        if not metrics:
+            return random.choice(ALL_BACKENDS)
+
+        min_load = float("inf")
+        candidates = []
+
+        for engine, m in metrics.items():
+            load = int(m.get("local_active_requests", 0))
+            if load < min_load:
+                min_load = load
+                candidates = [engine]
+            elif load == min_load:
+                candidates.append(engine)
+
+        return random.choice(candidates) if candidates else random.choice(ALL_BACKENDS)
+    
+    def reorder_preferred_engines(self, program_id: str, metrics: Dict[str, Dict]):
+        """
+        Reordena as engines favoritas com base na Proporção de Dominância:
+        (Requisições deste programa / Total de requisições na engine).
+        """
+        from routing.process_table import PROCESS_TABLE
+        
+        with PROCESS_TABLE.lock:
+            entry = PROCESS_TABLE.table.get(program_id)
+            if not entry or not entry.get("preferred_engines"):
+                return
+            
+            preferred = entry["preferred_engines"]
+            
+            def get_dominance_score(engine_id: str) -> tuple:
+                total_reqs = int(metrics.get(engine_id, {}).get("local_active_requests", 0))
+                
+                if total_reqs == 0:
+                    return (0.0, 0)
+                
+                my_reqs = sum(
+                    1 for th in entry.get("threads", {}).values()
+                    if th.get("engine_id") == engine_id and th.get("state") in ("running", "waiting")
+                )
+                
+                proportion = my_reqs / total_reqs
+                return (proportion, my_reqs)
+
+            # Ordena a lista in-place (maior proporção primeiro)
+            preferred.sort(key=get_dominance_score, reverse=True)
+
+    async def on_program_complete(self, program_id: str):
+        PROCESS_TABLE.clear_preferred_engines(program_id)
+
+
+class OrderedDynamicAutellixStrategy(BaseDynamicAutellixStrategy):
+    """
+    Cascata (Ordered): Tenta as engines na ordem em que foram adicionadas.
+    Prioriza maximizar o hit rate do Prefix Cache na engine principal.
+    """
+    async def select_engine(
+        self, program_id: Optional[str], num_input_tokens: int, metrics: Dict[str, Dict]
+    ) -> str:
+        if num_input_tokens <= self.short_request_threshold:
+            return self._select_least_used_global(metrics)
+
+        if program_id:
+            from routing.process_table import PROCESS_TABLE
+            proc = PROCESS_TABLE.get_process(program_id)
+            preferred = proc.get("preferred_engines", []) if proc else []
+
+            if preferred:
+                spillover_occurred = False
+                selected_engine = None
+
+                for idx, engine in enumerate(preferred):
+                    if not self._is_engine_full(engine, metrics):
+                        selected_engine = engine
+                        if idx > 0:
+                            spillover_occurred = True
+                        break
+                    else:
+                        spillover_occurred = True
+
+                if selected_engine:
+                    if spillover_occurred:
+                        self.reorder_preferred_engines(program_id, metrics)
+                    return selected_engine
+                
+                new_engine = self._select_least_used_global(metrics)
+                PROCESS_TABLE.add_preferred_engine(program_id, new_engine)
+                return new_engine
+
+        return self._select_least_used_global(metrics)
+
+
+class LeastLoadDynamicAutellixStrategy(BaseDynamicAutellixStrategy):
+    """
+    Least Load: Avalia todas as engines favoritas e envia para a mais ociosa.
+    Prioriza o balanceamento de carga entre o subset de engines do programa.
+    """
+    async def select_engine(
+        self, program_id: Optional[str], num_input_tokens: int, metrics: Dict[str, Dict]
+    ) -> str:
+        if num_input_tokens <= self.short_request_threshold:
+            return self._select_least_used_global(metrics)
+
+        if program_id:
+            proc = PROCESS_TABLE.get_process(program_id)
+            preferred = proc.get("preferred_engines", []) if proc else []
+
+            if preferred:
+                best_engine = None
+                best_load = float("inf")
+                all_full = True
+
+                for engine in preferred:
+                    if not self._is_engine_full(engine, metrics):
+                        all_full = False
+                        load = int(metrics.get(engine, {}).get("local_active_requests", 0))
+                        if load < best_load:
+                            best_load = load
+                            best_engine = engine
+
+                if not all_full and best_engine:
+                    return best_engine
+
+                # Spillover: Todas as engines favoritas estão cheias
+                new_engine = self._select_least_used_global(metrics)
+                PROCESS_TABLE.add_preferred_engine(program_id, new_engine)
+                return new_engine
+
+        return self._select_least_used_global(metrics)
+
+
+class ProbabilisticCascadeAutellixStrategy(BaseDynamicAutellixStrategy):
+    """
+    Cascata Probabilística (Stateless) com Proteção de Exaustão.
+    Avalia as engines favoritas em ordem. Faz spillover estocástico 
+    se a carga estiver alta. Se esgotar as favoritas, aloca uma nova.
+    Se o cluster inteiro esgotar, enfileira na engine menos carregada.
+    """
+    def __init__(
+        self, 
+        short_request_threshold: int = 2048, 
+        l_min_ratio: float = 0.50,  # 70% da capacidade = começa a vazar
+        l_max_ratio: float = 0.95   # 95% da capacidade = vaza 100% das requisições
+    ):
+        super().__init__(short_request_threshold)
+        self.l_min_ratio = l_min_ratio
+        self.l_max_ratio = l_max_ratio
+
+    def _select_least_used_subset(self, subset: List[str], metrics: Dict[str, Dict]) -> str:
+        """Encontra a engine mais ociosa apenas dentro de uma lista específica."""
+        if not subset:
+            return random.choice(ALL_BACKENDS)
+            
+        best_engine = subset[0]
+        min_load = float("inf")
+        
+        for engine in subset:
+            load = int(metrics.get(engine, {}).get("local_active_requests", 0))
+            if load < min_load:
+                min_load = load
+                best_engine = engine
+                
+        return best_engine
+
+    async def select_engine(
+        self, program_id: Optional[str], num_input_tokens: int, metrics: Dict[str, Dict]
+    ) -> str:
+        
+        # SHORT REQUEST → Load balance global
+        if num_input_tokens <= self.short_request_threshold:
+            return self._select_least_used_global(metrics)
+
+        # LONG REQUEST → Cascata Probabilística
+        if program_id:
+            from routing.process_table import PROCESS_TABLE
+            proc = PROCESS_TABLE.get_process(program_id)
+            preferred = proc.get("preferred_engines", []) if proc else []
+
+            if preferred:
+                spillover_occurred = False
+                selected_engine = None
+
+                for engine in preferred:
+                    capacity = BACKEND_PARALLELISM.get(engine, 10)
+                    load = int(metrics.get(engine, {}).get("local_active_requests", 0))
+                    
+                    l_min = capacity * self.l_min_ratio
+                    l_max = capacity * self.l_max_ratio
+
+                    # 1. Carga confortável: Fica nesta engine
+                    if load <= l_min:
+                        selected_engine = engine
+                        break
+                        
+                    # 2. Carga crítica: Spillover garantido
+                    if load >= l_max:
+                        spillover_occurred = True
+                        continue
+                        
+                    # 3. Zona de transição: Probabilidade de spillover
+                    p_spillover = (load - l_min) / (l_max - l_min)
+                    if random.random() > p_spillover:
+                        selected_engine = engine
+                        break
+                    else:
+                        spillover_occurred = True
+                        continue
+
+                if selected_engine:
+                    if spillover_occurred:
+                        self.reorder_preferred_engines(program_id, metrics)
+                    return selected_engine
+
+                # --- TRATAMENTO DE EXAUSTÃO ---
+                
+                # Se o loop terminou, todas as favoritas vazaram a requisição.
+                # Precisamos de uma engine nova. Quais ainda não foram usadas por este programa?
+                available_new_engines = [e for e in ALL_BACKENDS if e not in preferred]
+
+                if not available_new_engines:
+                    selected_engine = self._select_least_used_subset(preferred, metrics)
+                    self.reorder_preferred_engines(program_id, metrics)
+                    return selected_engine
+                
+                # SCALE-OUT: Aloca a engine mais ociosa dentre as que ainda não são favoritas
+                new_engine = self._select_least_used_subset(available_new_engines, metrics)
+                PROCESS_TABLE.add_preferred_engine(program_id, new_engine)
+                return new_engine
+
+        # Fallback de segurança global
+        return self._select_least_used_global(metrics)
+
+
+
+
 
 class LoadBalancer:
     """Coordinator: metrics collection, logging and strategy dispatch."""
@@ -375,6 +631,16 @@ class LoadBalancer:
                 fallback_strategy=fallback_strat,
             )
 
+        if name == "ordered-dynamic-autellix":
+            return OrderedDynamicAutellixStrategy(LOAD_BALANCER_SHORT_REQUEST_THRESHOLD)
+
+        if name == "least-load-dynamic-autellix":
+            return LeastLoadDynamicAutellixStrategy(LOAD_BALANCER_SHORT_REQUEST_THRESHOLD)
+        
+        if name == "probabilistic-cascade-autellix":
+            return ProbabilisticCascadeAutellixStrategy(
+                short_request_threshold=LOAD_BALANCER_SHORT_REQUEST_THRESHOLD
+            )
         # ------------------------
         # Safe Default
         # ------------------------

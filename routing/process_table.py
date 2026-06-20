@@ -24,7 +24,7 @@ class ProcessTable:
                     "kv_token_time_ewma": None,
 
                     # NEW (Autellix Alg.2, line 6)
-                    "preferred_engine": None,
+                    "preferred_engines": [],
 
                     "engine_ids": set(),
                     "threads": {},
@@ -132,14 +132,22 @@ class ProcessTable:
 
                 # 🔥 Autellix pinning rule:
                 # first long call determines program engine
-                if entry.get("preferred_engine") is None:
-                    entry["preferred_engine"] = engine_id
+                if not entry.get("preferred_engines"):
+                    entry["preferred_engines"] = [engine_id]
 
-    def clear_preferred_engine(self, program_id: str):
+    def add_preferred_engine(self, program_id: str, engine_id: str):
+        """Adiciona uma nova engine à lista de favoritas (Spillover)."""
         with self.lock:
             entry = self.table.get(program_id)
             if entry:
-                entry["preferred_engine"] = None
+                if engine_id not in entry["preferred_engines"]:
+                    entry["preferred_engines"].append(engine_id)
+
+    def clear_preferred_engines(self, program_id: str):
+        with self.lock:
+            entry = self.table.get(program_id)
+            if entry:
+                entry["preferred_engines"] = []
 
     def record_kv_tokens(self, program_id: str, call_id: str, prefill_tokens: int, decode_tokens: int):
         """Record KV token counts and calculate KV token-time.
@@ -248,7 +256,7 @@ class ProcessTable:
                 "service_ewma": entry.get("service_ewma"),
                 "call_count": entry.get("call_count", 0),
                 "waiting_time_cumulative": entry["waiting_time_cumulative"],
-                "preferred_engine": entry.get("preferred_engine"),
+                "preferred_engines": entry.get("preferred_engines", []),
                 "engine_ids": engine_ids_copy,
                 "threads": threads_copy,
                 "most_recent_call_arrival": entry["most_recent_call_arrival"],
@@ -276,7 +284,7 @@ class ProcessTable:
                 "service_time_cumulative": entry.get("service_time_cumulative", 0.0),
                 "service_time_max": entry.get("service_time_max", 0.0),
                 "waiting_time_cumulative": entry.get("waiting_time_cumulative", 0.0),
-                "preferred_engine": entry.get("preferred_engine"),
+                "preferred_engines": entry.get("preferred_engines", []),
                 "engine_ids": engine_ids_copy,
                 "threads": threads_copy,
                 "most_recent_call_arrival": entry.get("most_recent_call_arrival"),
