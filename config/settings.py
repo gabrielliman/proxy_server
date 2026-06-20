@@ -50,20 +50,17 @@ DISPATCH_MODE = "worker_pool"  # "direct", "worker_pool", "semaphore"
 PROCESS_TABLE_PRUNE_TTL = 600  # default 10 minutes
 PROCESS_TABLE_PRUNE_INTERVAL = 60  # run pruner every 60 seconds
 
-# Scheduler selection: 'fcfs' (default), 'plas', ...
+# Scheduler selection: 'fcfs' (default), 'plas', "atlas"
 SCHEDULER = os.getenv("SCHEDULER", "plas")
-PLAS_EWMA_ALPHA = 0.3
-PLAS_AGE_WEIGHT = 0.5
-PLAS_PRIORITY_BASE = 1.0
 
-# PLAS metric type: 'service_ewma' (default, LAS) or 'kv_token_time'
-# - service_ewma: Uses EWMA of actual service time (Least Attained Service)
-# - kv_token_time: Uses EWMA of KV token-time (d*c = pd + d²/2)
-PLAS_METRIC_TYPE = os.getenv("PLAS_METRIC_TYPE", "service_ewma")
+# PLAS metric type: 'service_cumulative' (default, LAS) or 'kv_token_time'
+# - service_cumulative: Uses sum of actual service time (Least Attained Service)
+# - kv_token_time: Uses sum of KV token-time (d*c = pd + d^2/2)
+PLAS_METRIC_TYPE = os.getenv("PLAS_METRIC_TYPE", "service_cumulative")
 
 # Discretized priority queues for PLAS (Autellix-style)
 DISCRETIZED_PRIORITY_BUCKETS = 10  # K: number of priority levels
-DISCRETIZED_PRIORITY_BASE = PLAS_PRIORITY_BASE * 2  # span to discretize (adjust as needed)
+DISCRETIZED_PRIORITY_BASE = 50.0   # Adjust this span based on your expected max cumulative metric
 ANTI_STARVATION_RATIO_THRESHOLD = 0.5  # beta: W_total/T_total >= threshold triggers promotion to Q1
 
 LOAD_BALANCER_SHORT_REQUEST_THRESHOLD = int(os.getenv("LOAD_BALANCER_SHORT_REQUEST_THRESHOLD", 2048))

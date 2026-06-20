@@ -1,5 +1,5 @@
 """
-PLAS scheduler helper: compute per-call priority using cumulative metrics.
+ATLAS scheduler helper: compute per-call priority using the thread's inherited critical path.
 """
 import itertools
 from typing import Tuple
@@ -13,18 +13,18 @@ _SEQ = itertools.count()
 def compute_priority(program_id: str, call_id: str) -> Tuple[float, int]:
     """Compute numeric priority for a (program_id, call_id).
 
-    Strictly follows Autellix Eq. 1: Priority is the sum of execution times 
-    (or KV token times) of all prior completed LLM calls for the program.
+    Strictly follows Autellix Eq. 2 (ATLAS): Priority is the maximum cumulative 
+    service time across all threads in the same program (the inherited critical path).
     Returns (priority_value, seq) where smaller value is higher priority.
     """
-    stats = PROCESS_TABLE.get_program_stats(program_id) or {}
+    th_stats = PROCESS_TABLE.get_thread_stats(program_id, call_id) or {}
     
     # Select metric based on config
     if PLAS_METRIC_TYPE == "kv_token_time":
-        priority_value = stats.get("kv_token_time_cumulative", 0.0)
+        priority_value = th_stats.get("inherited_kv_critical_path", 0.0)
     else:
-        # Default to standard PLAS (Least Attained Service)
-        priority_value = stats.get("service_time_cumulative", 0.0)
+        # Default to standard ATLAS (max critical path of service time)
+        priority_value = th_stats.get("inherited_critical_path", 0.0)
 
     seq = next(_SEQ)
     return priority_value, seq
@@ -32,19 +32,13 @@ def compute_priority(program_id: str, call_id: str) -> Tuple[float, int]:
 
 def update_on_completion(program_id: str, service_time: float, kv_token_time: float = None):
     """
-    ProcessTable.record_call_completion already handles the cumulative 
-    addition for both service_time and kv_token_time. 
-    We leave this as a no-op to avoid double-counting.
+    ProcessTable.record_call_completion handles the max() scalar update.
     """
     pass
 
 
 def map_priority_to_queue_index(priority_value: float, num_buckets: int, base_span: float) -> int:
-    """Map continuous PLAS priority to a discrete queue index.
-    
-    Priority ranges are equal-width from [0, base_span) divided into num_buckets.
-    Index 0 = Q1 (highest priority), index num_buckets-1 = QK (lowest priority).
-    """
+    """Map continuous ATLAS priority to a discrete queue index."""
     if priority_value < 0:
         priority_value = 0
     if base_span <= 0:

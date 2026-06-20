@@ -16,12 +16,13 @@ class ProcessTable:
                     "service_time_cumulative": 0.0,
                     "service_time_max": 0.0,
                     "waiting_time_cumulative": 0.0,
-                    "service_ewma": None,
                     "call_count": 0,
 
                     # KV token-time metric (d*c = pd + d²/2)
                     "kv_token_time_cumulative": 0.0,
-                    "kv_token_time_ewma": None,
+
+                    "longest_critical_path": 0.0,
+                    "longest_kv_critical_path": 0.0,
 
                     # NEW (Autellix Alg.2, line 6)
                     "preferred_engines": [],
@@ -53,6 +54,8 @@ class ProcessTable:
                 "service_time": 0.0,
                 "engine_id": None,
                 "state": "waiting",
+                "inherited_critical_path": entry.get("longest_critical_path", 0.0),
+                "inherited_kv_critical_path": entry.get("longest_kv_critical_path", 0.0),
                 # KV token tracking
                 "prefill_tokens": prefill_tokens,
                 "decode_tokens": None,
@@ -199,18 +202,11 @@ class ProcessTable:
             if service > entry["service_time_max"]:
                 entry["service_time_max"] = service
 
-            # update EWMA/count for service time
-            entry["call_count"] = entry.get("call_count", 0) + 1
-            # leave EWMA update to scheduler with configured alpha if needed; keep simple decay here
-            ewma = entry.get("service_ewma")
-            if ewma is None:
-                entry["service_ewma"] = service
-            else:
-                # default small-alpha smoothing; scheduler may override using config
-                alpha = 0.3
-                entry["service_ewma"] = alpha * service + (1 - alpha) * ewma
+            thread_path = th.get("inherited_critical_path", 0.0) + service
+            entry["longest_critical_path"] = max(entry.get("longest_critical_path", 0.0), thread_path)
 
-            # Update KV token-time EWMA if tokens were recorded
+            entry["call_count"] = entry.get("call_count", 0) + 1
+
             prefill_tokens = th.get("prefill_tokens")
             decode_tokens = output_tokens if output_tokens is not None else th.get("decode_tokens")
             
@@ -223,12 +219,9 @@ class ProcessTable:
                 # Update cumulative
                 entry["kv_token_time_cumulative"] = entry.get("kv_token_time_cumulative", 0.0) + kv_time
                 
-                # Update EWMA
-                kv_ewma = entry.get("kv_token_time_ewma")
-                if kv_ewma is None:
-                    entry["kv_token_time_ewma"] = kv_time
-                else:
-                    entry["kv_token_time_ewma"] = alpha * kv_time + (1 - alpha) * kv_ewma
+                # ATLAS: Update global critical path scalar for KV token time
+                kv_thread_path = th.get("inherited_kv_critical_path", 0.0) + kv_time
+                entry["longest_kv_critical_path"] = max(entry.get("longest_kv_critical_path", 0.0), kv_thread_path)
 
             entry["most_recent_call_completion"] = now
 
@@ -253,7 +246,6 @@ class ProcessTable:
             result = {
                 "service_time_cumulative": entry["service_time_cumulative"],
                 "service_time_max": entry["service_time_max"],
-                "service_ewma": entry.get("service_ewma"),
                 "call_count": entry.get("call_count", 0),
                 "waiting_time_cumulative": entry["waiting_time_cumulative"],
                 "preferred_engines": entry.get("preferred_engines", []),
@@ -263,7 +255,6 @@ class ProcessTable:
                 "most_recent_call_completion": entry["most_recent_call_completion"],
                 # KV token-time metrics
                 "kv_token_time_cumulative": entry.get("kv_token_time_cumulative", 0.0),
-                "kv_token_time_ewma": entry.get("kv_token_time_ewma"),
             }
 
         return result
@@ -354,22 +345,33 @@ class ProcessTable:
                 if now - last_arrival > ttl_seconds:
                     del self.table[pid]
                     removed.append(pid)
-
         return removed
 
+    def get_thread_stats(self, program_id: str, call_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch the inherited critical path metrics for a specific thread (ATLAS)."""
+        with self.lock:
+            entry = self.table.get(program_id)
+            if not entry:
+                return None
+            th = entry.get("threads", {}).get(call_id)
+            if not th:
+                return None
+            return {
+                "inherited_critical_path": th.get("inherited_critical_path", 0.0),
+                "inherited_kv_critical_path": th.get("inherited_kv_critical_path", 0.0),
+            }
+
     def get_program_stats(self, program_id: str) -> Optional[Dict[str, Any]]:
-        """Return a small stats dict useful for schedulers (EWMA, counts, last arrival)."""
+        """Return a small stats dict useful for schedulers (counts, last arrival)."""
         with self.lock:
             entry = self.table.get(program_id)
             if not entry:
                 return None
             return {
-                "service_ewma": entry.get("service_ewma"),
                 "call_count": entry.get("call_count", 0),
                 "service_time_cumulative": entry.get("service_time_cumulative", 0.0),
                 "most_recent_call_arrival": entry.get("most_recent_call_arrival"),
                 # KV token-time metrics
-                "kv_token_time_ewma": entry.get("kv_token_time_ewma"),
                 "kv_token_time_cumulative": entry.get("kv_token_time_cumulative", 0.0),
             }
 

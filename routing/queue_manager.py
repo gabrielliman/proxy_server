@@ -73,14 +73,13 @@ def init_queues():
     if backend_queues:
         return
 
-    if SCHEDULER == "plas":
+    if SCHEDULER in ("plas", "atlas"):
         from config.settings import DISCRETIZED_PRIORITY_BUCKETS
         backend_queues = {
             backend: DiscretizedQueueWrapper(DISCRETIZED_PRIORITY_BUCKETS)
             for backend in ALL_BACKENDS
         }
     else:
-        # FCFS: plain asyncio.Queue
         backend_queues = {backend: asyncio.Queue() for backend in ALL_BACKENDS}
 
 
@@ -91,25 +90,24 @@ def get_queue(backend: str):
 
 async def put_request(backend: str, priority: float, item: Any):
     q = get_queue(backend)
-    # DiscretizedQueueWrapper for PLAS: map priority to queue index
-    if SCHEDULER == "plas" and isinstance(q, DiscretizedQueueWrapper):
-        from routing.scheduler_plas import map_priority_to_queue_index
+    
+    if SCHEDULER in ("plas", "atlas") and isinstance(q, DiscretizedQueueWrapper):
+        if SCHEDULER == "atlas":
+            from routing.scheduler_atlas import map_priority_to_queue_index
+        else:
+            from routing.scheduler_plas import map_priority_to_queue_index
+            
         from config.settings import DISCRETIZED_PRIORITY_BUCKETS, DISCRETIZED_PRIORITY_BASE
         queue_idx = map_priority_to_queue_index(priority, DISCRETIZED_PRIORITY_BUCKETS, DISCRETIZED_PRIORITY_BASE)
         await q.put(queue_idx, item)
-    elif SCHEDULER == "plas":
-        # fallback to direct priority (shouldn't happen but safe)
+    elif SCHEDULER in ("plas", "atlas"):
         await q.put(priority, item)
     else:
-        # FCFS: ignore priority
         await q.put(item)
-
 
 async def get_request(backend: str):
     q = get_queue(backend)
-    # DiscretizedQueueWrapper scans K queues from highest priority down
-    if SCHEDULER == "plas" and isinstance(q, DiscretizedQueueWrapper):
+    if SCHEDULER in ("plas", "atlas") and isinstance(q, DiscretizedQueueWrapper):
         return await q.get()
     else:
-        # FCFS: plain asyncio.Queue.get()
         return await q.get()
