@@ -5,13 +5,13 @@ import httpx
 import time
 from routing.dispatcher.base import BaseDispatcher
 from routing.queue_manager import get_queue, put_request, get_request
-from config.settings import REQUEST_TIMEOUT, BACKEND_PARALLELISM, ALL_BACKENDS, SCHEDULER,MODEL
+from config.settings import REQUEST_TIMEOUT, BACKEND_PARALLELISM, ALL_BACKENDS, SCHEDULER, MODEL
 from routing.scheduler_plas import compute_priority
 from utils.tokenizer_utils import get_tokenizer
 
 class WorkerPoolDispatcher(BaseDispatcher):
     workers_started = False
-
+    shared_client = None  # Variável de classe para segurar o cliente global
 
     async def start_workers(self):
         if WorkerPoolDispatcher.workers_started:
@@ -20,67 +20,80 @@ class WorkerPoolDispatcher(BaseDispatcher):
 
         loop = asyncio.get_running_loop()
 
+        # 1. Cria UM ÚNICO cliente para ser usado por todos os workers.
+        # Definimos limites agressivos pois esse cliente centralizará todo o tráfego.
+        limits = httpx.Limits(max_keepalive_connections=500, max_connections=2000)
+        WorkerPoolDispatcher.shared_client = httpx.AsyncClient(
+            timeout=REQUEST_TIMEOUT, 
+            limits=limits
+        )
+
         for backend in ALL_BACKENDS:
             queue = get_queue(backend)
             n_workers = BACKEND_PARALLELISM.get(backend, 1)
 
             for worker_id in range(n_workers):
-                loop.create_task(self.worker_loop(backend, queue, worker_id))
+                # 2. Passa o cliente compartilhado para a função do worker
+                loop.create_task(self.worker_loop(backend, queue, worker_id, WorkerPoolDispatcher.shared_client))
 
-    async def worker_loop(self, backend, queue, worker_id):
+    # 3. O worker agora recebe o 'client' como argumento
+    async def worker_loop(self, backend, queue, worker_id, client):
+        
+        # REMOVIDO: async with httpx.AsyncClient(...) as client:
+        # Agora usamos o cliente global diretamente no loop infinito
+        while True:
+            if SCHEDULER == "plas":
+                item = await get_request(backend)
+            else:
+                item = await queue.get()
+            
+            data = item["data"]
+            future = item["future"]
+            pid = item.get("program_id")
+            cid = item.get("call_id")
 
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            while True:
-                if SCHEDULER == "plas":
-                    item = await get_request(backend)
-                else:
-                    item = await queue.get()
-                data = item["data"]
-                future = item["future"]
-                pid = item.get("program_id")
-                cid = item.get("call_id")
+            from routing.process_table import PROCESS_TABLE
 
-                from routing.process_table import PROCESS_TABLE
+            # record dequeue event
+            if pid and cid:
+                PROCESS_TABLE.record_dequeue(pid, cid)
 
-                # record dequeue event
+            start = None
+            try:
+                # mark start (waiting -> running)
+                start = time.time()
+                output_tokens = None
                 if pid and cid:
-                    PROCESS_TABLE.record_dequeue(pid, cid)
+                    PROCESS_TABLE.record_call_start(pid, cid, engine_id=backend, start_time=start)
 
-                start = None
-                try:
-                    # mark start (waiting -> running)
-                    start = time.time()
-                    output_tokens = None
-                    if pid and cid:
-                        PROCESS_TABLE.record_call_start(pid, cid, engine_id=backend, start_time=start)
+                # Reutilizando o cliente global, salvando centenas de sockets!
+                resp = await client.post(f"{backend}/v1/chat/completions", json=data)
+                resp_json = resp.json()
+                
+                # Extract output tokens from response
+                if resp_json and "choices" in resp_json:
+                    choice = resp_json["choices"][0] if resp_json["choices"] else {}
+                    text = choice.get("message", {}).get("content", "") or choice.get("text", "")
+                    if text:
+                        tok = get_tokenizer()
+                        output_tokens = len(tok.encode(text, add_special_tokens=False))
 
-                    resp = await client.post(f"{backend}/v1/chat/completions", json=data)
-                    resp_json = resp.json()
-                    
-                    # Extract output tokens from response
-                    if resp_json and "choices" in resp_json:
-                        choice = resp_json["choices"][0] if resp_json["choices"] else {}
-                        text = choice.get("message", {}).get("content", "") or choice.get("text", "")
-                        if text:
-                            tok = get_tokenizer()
-                            output_tokens = len(tok.encode(text, add_special_tokens=False))
+                if not future.done():
+                    future.set_result(resp_json)
 
-                    if not future.done():
-                        future.set_result(resp_json)
+            except Exception as e:
+                print(f"[WORKER ERROR] {e}")
+                if not future.done():
+                    future.set_exception(e)
 
-                except Exception as e:
-                    print(f"[WORKER ERROR] {e}")
-                    if not future.done():
-                        future.set_exception(e)
-
-                finally:
-                    # completion
-                    end = time.time()
-                    if pid and cid:
-                        PROCESS_TABLE.record_call_completion(pid, cid, completion_time=end, output_tokens=output_tokens)
-                    # call task_done if supported (asyncio.Queue)
-                    if hasattr(queue, "task_done") and not SCHEDULER == "plas":
-                        queue.task_done()
+            finally:
+                # completion
+                end = time.time()
+                if pid and cid:
+                    PROCESS_TABLE.record_call_completion(pid, cid, completion_time=end, output_tokens=output_tokens)
+                # call task_done if supported (asyncio.Queue)
+                if hasattr(queue, "task_done") and not SCHEDULER == "plas":
+                    queue.task_done()
 
     async def dispatch(self, backend: str, data: dict, program_id: str = None, call_id: str = None) -> dict:
         from routing.process_table import PROCESS_TABLE
@@ -106,4 +119,3 @@ class WorkerPoolDispatcher(BaseDispatcher):
             await queue.put(item)
 
         return await future
-

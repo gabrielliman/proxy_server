@@ -3,7 +3,7 @@ version: 1.1
 kind: operation
 tags: [examples, bash]
 queue: axia/default
-name: teste-axia-70B
+name: lats_burstiness05
 component:
   kind: component
   run:
@@ -14,7 +14,7 @@ component:
 
     container:
       # Pode adicionar qualquer imagem dockerhub
-      image: willianjunior/vllm-0.19.0:latest
+      image: gabrielliman/proxy_server:latest
 
       # Diretório inicial: local onde foi feito os uploads
       workingDir: "{{ globals.artifacts_path }}/{{ globals.uuid }}/uploads"
@@ -23,11 +23,11 @@ component:
       # storage local da axia, /scratch, que pode ser usado por qualquer
       # job ou usuário.
       # command: ["bash", "-c", "set -x; pwd; ls; ls /scratch; bash my_script.sh"]
-      command: ["bash", "-c", "set -x; pwd; ls; ls /scratch; bash polyaxon_benchmark.sh"]
-
+      command: ["bash", "-c", "set -x; pwd; ls; ls /scratch; bash polyaxon_lats_benchmark.sh"]
+      # command: ["bash", "-c", "set -x; pwd; ls; ls /scratch;"]
       # Defina ambos 'requests' e 'limits' para asegurar alocação exclusiva.
       resources:
         requests:
-          nvidia.com/gpu: 4
+          nvidia.com/gpu: 1
         limits:
-          nvidia.com/gpu: 4
+          nvidia.com/gpu: 1

@@ -4,7 +4,7 @@ from config.settings import ALL_BACKENDS, METRICS_INTERVAL, METRICS_TIMEOUT, BAC
 from metrics.parser import parse_prometheus_metrics
 from routing.selector import backend_metrics, metrics_lock
 from metrics.csv_writer import log_kv_cache
-
+from routing.process_table import PROCESS_TABLE
 
 backend_metrics = BACKEND_METRICS
 
@@ -25,23 +25,28 @@ async def monitor_backend(url):
             if raw:
                 parsed = parse_prometheus_metrics(raw)
 
-                # ✅ NEW — write KV cache
-                log_kv_cache(url, parsed.get("kv_cache", []))
+                # ✅ 1. Fetch the global count from the process table
+                incomplete_count = PROCESS_TABLE.get_incomplete_requests_count()
+                waiting_count = PROCESS_TABLE.get_waiting_requests_count()
+
+                # ✅ 2. Pass it into the CSV writer alongside the backend metrics
+                log_kv_cache(url, parsed.get("kv_cache", []), incomplete_count, waiting_count)
 
                 with metrics_lock:
                     backend_metrics[url].update(parsed)
                     backend_metrics[url]["last_updated"] = asyncio.get_event_loop().time()
+                    # You can safely keep it here if your /status endpoint needs it
+                    backend_metrics[url]["incomplete_count"] = incomplete_count
+                    backend_metrics[url]["proxy_waiting_count"] = waiting_count
 
         except Exception:
-            # prevents the dreaded:
-            # "Task exception was never retrieved"
             import traceback
             traceback.print_exc()
 
         await asyncio.sleep(METRICS_INTERVAL)
 
 
-
 def start_monitoring_tasks(app):
+    # Only the backend monitors are needed now!
     for backend_url in ALL_BACKENDS:
         asyncio.create_task(monitor_backend(backend_url))

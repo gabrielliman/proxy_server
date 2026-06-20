@@ -4,13 +4,11 @@ from base import Task
 from hotpot import *
 from models import gpt
 import logging
-from transformers import GPT2Tokenizer
 import random
-
-tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+from models import tokens_in_text
 
 def get_token_length(text):
-    return len(tokenizer.encode(text))
+    return tokens_in_text(text)
 
 max_token_length = 4000
 

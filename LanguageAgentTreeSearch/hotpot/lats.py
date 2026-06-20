@@ -35,17 +35,6 @@ def get_value(task, x, y, n_evaluate_sample, failed_trajectories, reflection_map
         task.value_cache[value_prompt] = value
     return value
 
-# def get_values(task, x, ys, n_evaluate_sample, failed_trajectories, reflection_map, cache_value=True, program_id="default_prog"):
-#     values = []
-#     local_value_cache = {}
-#     for y in ys:  # each partial output
-#         if y in local_value_cache:  # avoid duplicate candidates
-#             value = 0
-#         else:    
-#             value = get_value(task, x, y, n_evaluate_sample, failed_trajectories, reflection_map, cache_value=cache_value, program_id=program_id)
-#             local_value_cache[y] = value
-#         values.append(value)
-#     return values
 import concurrent.futures
 
 def get_values(task, x, ys, n_evaluate_sample, failed_trajectories, reflection_map, cache_value=True, program_id="default_prog"):
@@ -80,8 +69,8 @@ def get_values(task, x, ys, n_evaluate_sample, failed_trajectories, reflection_m
 def get_samples(task, x, y, n_generate_sample, prompt_sample, stop, failed_trajectories, reflection_map, program_id="default_prog"):
     unique_trajectories = get_unique_trajectories(failed_trajectories)
     if len(unique_trajectories) > len(reflection_map) and len(unique_trajectories) < 4:
-        print(f"[{program_id}] 6) REFLECTION: Gerando reflexão sobre trajetória falha...")
-        print(f"[{program_id}] generating reflections")
+        # print(f"[{program_id}] 6) REFLECTION: Gerando reflexão sobre trajetória falha...")
+        # print(f"[{program_id}] generating reflections")
         reflection_map.extend(task.generate_self_reflection(unique_trajectories, x, program_id=program_id))
         
     if prompt_sample == 'standard':
@@ -265,7 +254,7 @@ def lats_search(args, task, idx, iterations=30, to_print=True, program_id="defau
     return best_child.state, best_child.value, all_nodes, best_child.reward, best_child.em
 
 def select_node(node, program_id="default_prog"):
-    print(f"[{program_id}] 1) SELECTION: Selecionando nó na profundidade {node.depth}")
+    # print(f"[{program_id}] 1) SELECTION: Selecionando nó na profundidade {node.depth}")
     while node and node.children:
         logging.info(f"[{program_id}] Selecting from {len(node.children)} children at depth {node.depth}.")
         
@@ -295,7 +284,7 @@ def select_node(node, program_id="default_prog"):
 def expand_node(node, args, task, env, failed_trajectories, reflection_map, program_id="default_prog"):
     if node.depth >= 7:
         logging.info(f"[{program_id}] Depth limit reached")
-        print(f"[{program_id}] Depth limit reached")
+        # print(f"[{program_id}] Depth limit reached")
         node.is_terminal = True
         return
     new_nodes = generate_new_states(node, args, task, args.n_generate_sample, env, failed_trajectories, reflection_map, program_id)
@@ -304,7 +293,7 @@ def expand_node(node, args, task, env, failed_trajectories, reflection_map, prog
 def rollout(node, args, task, idx, env, failed_trajectories, reflection_map, max_depth=4, program_id="default_prog"):
     logging.info(f"[{program_id}] ROLLING OUT")
     depth = node.depth
-    print(f"[{program_id}] 4) SIMULATION: Fazendo rollout a partir da profundidade {depth}...")
+    # print(f"[{program_id}] 4) SIMULATION: Fazendo rollout a partir da profundidade {depth}...")
 
     n = 5
     rewards = [0]
@@ -335,7 +324,7 @@ def rollout(node, args, task, idx, env, failed_trajectories, reflection_map, max
     return sum(rewards) / len(rewards), node
 
 def generate_new_states(node, args, task, n, env, failed_trajectories, reflection_map, program_id="default_prog"):
-    print(f"[{program_id}] 2) EXPANSION: Gerando {n} novas ações...")
+    # print(f"[{program_id}] 2) EXPANSION: Gerando {n} novas ações...")
     prompt = generate_prompt(node)
     sampled_actions = get_samples(task, prompt, f"Thought {node.depth + 1}: ", n, prompt_sample=args.prompt_sample, stop="Observation", failed_trajectories=failed_trajectories, reflection_map=reflection_map, program_id=program_id)
     logging.info(f"[{program_id}] SAMPLED ACTION: {sampled_actions}")
@@ -387,7 +376,7 @@ def generate_new_states(node, args, task, n, env, failed_trajectories, reflectio
 
 
 def evaluate_node(node, args, task, failed_trajectories, reflection_map, program_id="default_prog"):
-    print(f"[{program_id}] 3) EVALUATION: Avaliando {len(node.children)} nós filhos...")
+    # print(f"[{program_id}] 3) EVALUATION: Avaliando {len(node.children)} nós filhos...")
     child_prompts = [generate_prompt(child) for child in node.children if not child.is_terminal]
     votes = get_values(task, node.question, child_prompts, args.n_evaluate_sample, failed_trajectories, reflection_map, program_id=program_id)
     
@@ -409,7 +398,7 @@ def print_tree(node, level=0):
         print_tree(child, level + 1)
 
 def backpropagate(node, value, program_id="default_prog"):
-    print(f"[{program_id}] 5) BACKPROPAGATION: Subindo valor {value:.2f} pela árvore...")
+    # print(f"[{program_id}] 5) BACKPROPAGATION: Subindo valor {value:.2f} pela árvore...")
     while node:
         node.visits += 1
         if node.is_terminal:

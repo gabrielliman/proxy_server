@@ -1,8 +1,9 @@
 #!/bin/bash
-# START VLLM SERVERS
-
-source /opt/conda/etc/profile.d/conda.sh && conda activate proxy_server
+export HF_HOME="/mnt/scratch/global/huggingface_cache/huggingface"
+source /opt/miniconda/etc/profile.d/conda.sh
+conda activate /mnt/scratch/scheduler/envs/proxy_server
 set -x
+
 
 # ## arruma um dos warning, mas nao entendi direito
 FLASHINFER_DIR="/opt/conda/envs/proxy_server/lib/python3.12/site-packages/flashinfer/data/include/flashinfer/comm"
@@ -22,36 +23,18 @@ done
 # ============================================================
 # Global Configuration
 # ============================================================
-
-# Set the model name once
 rm ./kv_cache_usage.csv 2>/dev/null || true
-
+# Set the model name once
 MODEL_NAME="meta-llama/Llama-3.1-8B-Instruct"
-MODEL_PATH="/scratch/hpc4ai/models/llama/Llama-3.1-8B-Instruct"
+MODEL_PATH="meta-llama/Llama-3.1-8B-Instruct"
 
 
 # Define the ports as an array. Add or remove ports here to automatically scale.
-PORTS=(8105 8106 8107 8108)
+PORTS=(8105 8106)
 
 # Shared parameters
-MAX_NUM_SEQS=256
+MAX_NUM_SEQS=10
 LOG_DIR="./var/logs"
-
-export MODEL="$MODEL_NAME"
-export MODEL_ROUTES="{
-  \"$MODEL_NAME\": [
-    \"http://localhost:8105\", 
-    \"http://localhost:8106\",
-    \"http://localhost:8107\",
-    \"http://localhost:8108\"
-  ]
-}"
-export BACKEND_PARALLELISM='{
-  "http://localhost:8105": 256, 
-  "http://localhost:8106": 256,
-  "http://localhost:8107": 256,
-  "http://localhost:8108": 256
-}'
 
 # ============================================================
 # Setup & Helper Functions
@@ -87,9 +70,9 @@ for PORT in "${PORTS[@]}"; do
         --max-num-seqs "$MAX_NUM_SEQS" \
         --dtype bfloat16 \
         --max-model-len 40000 \
-        --gpu-memory-utilization 0.45 \
+        --gpu-memory-utilization 0.9 \
         --served-model-name $MODEL_NAME \
-        2>&1 | tee "$LOG_DIR/saida_VLLM_${PORT}.txt" &
+        2>&1 | tee "$LOG_DIR/saida_VLLM_${PORT}.txt" & 
         
     # This executes exactly as: PID1=$!, PID2=$!, etc.
     eval "PID${ENGINE_IDX}=\$!"
@@ -98,9 +81,8 @@ for PORT in "${PORTS[@]}"; do
     eval "echo '[INFO] Engine $PORT assigned to PID${ENGINE_IDX}=\$PID${ENGINE_IDX}'"
         
     wait_for_ready "$PORT"
-    if (( ENGINE_IDX % 2 == 0 )); then
-        GPU=$((GPU + 1))
-    fi
+    GPU=$((GPU + 1))
+
     ENGINE_IDX=$((ENGINE_IDX + 1))
 done
 # ============================================================
@@ -108,12 +90,12 @@ done
 # ============================================================
 BASE_URL="http://localhost:8081"
 #trocar para local na scratch
-DATASET="./ShareGPT_V3_unfiltered_cleaned_split.json"
+DATASET="/mnt/scratch/global/datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
 
-if [ ! -f "$DATASET" ]; then
-    echo "[INFO] Downloading dataset..."
-    curl -L https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json -o "$DATASET"
-fi
+# if [ ! -f "$DATASET" ]; then
+#     echo "[INFO] Downloading dataset..."
+#     curl -L https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json -o "$DATASET"
+# fi
 
 # ============================================================
 # Engines (metrics + reset) dynamically generated from PORTS
@@ -130,12 +112,12 @@ done
 # Experiment grid
 # ============================================================
 MODEL="$MODEL_NAME"
-LIMIT=66400 #numero de conversas do share gpt (num programas)
-OUTPUTS_DIR="outputs/teste"
+LIMIT=10
+OUTPUTS_DIR="outputs/teste3"
 mkdir -p "$OUTPUTS_DIR"
-CHAT_LEN=-1 #tamanho fixo das conversas, se -1 pega de qualquer
+CHAT_LEN=-10
 REPEATS=1
-RATES=("1000")
+RATES=("8")
 # RATES=("0.5" "1" "2" "4" "8")
 BURSTINESS=1
 
@@ -479,4 +461,4 @@ echo "All benchmarks completed successfully."
 echo "======================================"
 
 echo "[INFO] Stopping vLLM engines..."
-kill "$PID1" "$PID2" "$PID3" "$PID4" 2>/dev/null || true
+kill "$PID1" "$PID2" 2>/dev/null || true

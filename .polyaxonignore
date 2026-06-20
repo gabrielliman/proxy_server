@@ -1,3 +1,6 @@
 __pycache__
 var/logs/*
 outputs/*
+outputs_lats/*
+docker/*
+LanguageAgentTreeSearch/hotpot/results/*

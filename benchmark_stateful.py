@@ -36,6 +36,8 @@ class RequestMetrics:
 class ProgramMetrics:
     program_id: str
     requests: List[RequestMetrics]
+    waiting_time: float = None
+    service_time: float = None
 
 
 # ============================================================
@@ -54,14 +56,15 @@ def _tpot_list(reqs: List[RequestMetrics]) -> List[float]:
     tpot_list = []
     for r in reqs:
         if r.output_tokens > 1:
-            tpot_list.append((r.latency - r.ttft) / (r.output_tokens - 1))
+            tpot_list.append((r.latency)/ (r.output_tokens - 1))
     return tpot_list
 
 
 def summarize_program(prog: ProgramMetrics) -> Dict[str, Any]:
-    ttfts = [r.ttft for r in prog.requests if r.ttft > 0] #ERRADO
+    if not prog.requests:
+        return {"program_id": prog.program_id, "num_requests": 0}
+    prog_ttfts = min(r.end_time for r in prog.requests) - min(r.start_time for r in prog.requests) if prog.requests else None
     latencies = [r.latency for r in prog.requests if r.latency > 0]    #latencia de uma requisicao é o tempo desde que foi enviada para o escalonador ate receber resposta
-    itls = [t for r in prog.requests for t in r.itl]
     output_tokens = [r.output_tokens for r in prog.requests]
     input_tokens = [r.input_tokens for r in prog.requests]
     start = min(r.start_time for r in prog.requests)
@@ -71,31 +74,36 @@ def summarize_program(prog: ProgramMetrics) -> Dict[str, Any]:
     total_output_tokens = sum(output_tokens)
     total_input_tokens = sum(input_tokens)
     total_tokens = total_input_tokens + total_output_tokens
+    waiting_time = prog.waiting_time
+    service_time = prog.service_time
 
     tpots = _tpot_list(prog.requests)
 
     return {
         "program_id": prog.program_id,
-        "total_e2el_ms": full_time,
+        "total_e2el_s": full_time,
         "num_requests": len(prog.requests),
         "total_input_tokens": total_input_tokens,
         "total_output_tokens": total_output_tokens,
+        "prog_ttft_s": prog_ttfts if prog_ttfts else None,
+        "waiting_time_s": waiting_time,
+        "service_time_s": service_time,
 
         "request_throughput_rps": safe_div(len(latencies), total_latency),
         "output_token_throughput": safe_div(total_output_tokens, total_latency),
         "total_token_throughput": safe_div(total_tokens, total_latency),
 
-        "mean_ttft_ms": float(np.mean(ttfts)) * 1000 if ttfts else None,
-        "median_ttft_ms": float(np.median(ttfts)) * 1000 if ttfts else None,
-        "p99_ttft_ms": percentile(ttfts, 99) * 1000 if ttfts else None,
+        # "mean_ttft_ms": float(np.mean(ttfts)) * 1000 if ttfts else None,
+        # "median_ttft_ms": float(np.median(ttfts)) * 1000 if ttfts else None,
+        # "p99_ttft_ms": percentile(ttfts, 99) * 1000 if ttfts else None,
 
         "mean_tpot_ms": float(np.mean(tpots)) * 1000 if tpots else None,
         "median_tpot_ms": float(np.median(tpots)) * 1000 if tpots else None,
         "p99_tpot_ms": percentile(tpots, 99) * 1000 if tpots else None,
 
-        "mean_itl_ms": float(np.mean(itls)) * 1000 if itls else None,
-        "median_itl_ms": float(np.median(itls)) * 1000 if itls else None,
-        "p99_itl_ms": percentile(itls, 99) * 1000 if itls else None,
+        # "mean_itl_ms": float(np.mean(itls)) * 1000 if itls else None,
+        # "median_itl_ms": float(np.median(itls)) * 1000 if itls else None,
+        # "p99_itl_ms": percentile(itls, 99) * 1000 if itls else None,
 
         "mean_e2el_ms": float(np.mean(latencies)) * 1000 if latencies else None,
         "median_e2el_ms": float(np.median(latencies)) * 1000 if latencies else None,
@@ -156,10 +164,10 @@ def separate_requests_by_latency(
         
         if valid_requests:
             valid_latencies = [r.latency for r in valid_requests if r.latency > 0]
-            valid_ttfts = [r.ttft for r in valid_requests if r.ttft > 0]
+            # valid_ttfts = [r.ttft for r in valid_requests if r.ttft > 0]
             valid_output_tokens = [r.output_tokens for r in valid_requests]
             valid_input_tokens = [r.input_tokens for r in valid_requests]
-            valid_itls = [t for r in valid_requests for t in r.itl]
+            # valid_itls = [t for r in valid_requests for t in r.itl]
             valid_tpots = _tpot_list(valid_requests)
             
             total_latency = sum(valid_latencies)
@@ -185,17 +193,17 @@ def separate_requests_by_latency(
                 "p95_e2el_ms": percentile(valid_latencies, 95) * 1000 if valid_latencies else None,
                 "p99_e2el_ms": percentile(valid_latencies, 99) * 1000 if valid_latencies else None,
                 
-                "mean_ttft_ms": float(np.mean(valid_ttfts)) * 1000 if valid_ttfts else None,
-                "median_ttft_ms": float(np.median(valid_ttfts)) * 1000 if valid_ttfts else None,
-                "p99_ttft_ms": percentile(valid_ttfts, 99) * 1000 if valid_ttfts else None,
+                # "mean_ttft_ms": float(np.mean(valid_ttfts)) * 1000 if valid_ttfts else None,
+                # "median_ttft_ms": float(np.median(valid_ttfts)) * 1000 if valid_ttfts else None,
+                # "p99_ttft_ms": percentile(valid_ttfts, 99) * 1000 if valid_ttfts else None,
                 
                 "mean_tpot_ms": float(np.mean(valid_tpots)) * 1000 if valid_tpots else None,
                 "median_tpot_ms": float(np.median(valid_tpots)) * 1000 if valid_tpots else None,
                 "p99_tpot_ms": percentile(valid_tpots, 99) * 1000 if valid_tpots else None,
                 
-                "mean_itl_ms": float(np.mean(valid_itls)) * 1000 if valid_itls else None,
-                "median_itl_ms": float(np.median(valid_itls)) * 1000 if valid_itls else None,
-                "p99_itl_ms": percentile(valid_itls, 99) * 1000 if valid_itls else None,
+                # "mean_itl_ms": float(np.mean(valid_itls)) * 1000 if valid_itls else None,
+                # "median_itl_ms": float(np.median(valid_itls)) * 1000 if valid_itls else None,
+                # "p99_itl_ms": percentile(valid_itls, 99) * 1000 if valid_itls else None,
             }
         else:
             metrics_per_percentile[p] = {
@@ -233,7 +241,7 @@ def separate_all_programs_by_latency(
 
 
 def summarize_full(prog: ProgramMetrics) -> Dict[str, Any]:
-    ttfts = [r.ttft for r in prog.requests if r.ttft > 0] #ERRADO
+    ttft = min(r.end_time for r in prog.requests) - min(r.start_time for r in prog.requests) if prog.requests else None
     latencies = [r.latency for r in prog.requests if r.latency > 0]   #latencia de uma requisicao é o tempo desde que foi enviada para o escalonador ate receber resposta
     itls = [t for r in prog.requests for t in r.itl]
     output_tokens = [r.output_tokens for r in prog.requests]
@@ -250,25 +258,26 @@ def summarize_full(prog: ProgramMetrics) -> Dict[str, Any]:
         "num_requests": len(prog.requests),
         "total_input_tokens": total_input_tokens,
         "total_output_tokens": total_output_tokens,
+        "ttft_s": ttft if ttft else None,
 
         "request_throughput_rps": safe_div(len(latencies), total_latency),
         "output_token_throughput": safe_div(total_output_tokens, total_latency),
         "total_token_throughput": safe_div(total_tokens, total_latency),
 
-        "mean_ttft_ms": float(np.mean(ttfts)) * 1000 if ttfts else None,
-        "median_ttft_ms": float(np.median(ttfts)) * 1000 if ttfts else None,
-        "p90_ttft_ms": percentile(ttfts, 90) * 1000 if ttfts else None,
-        "p99_ttft_ms": percentile(ttfts, 99) * 1000 if ttfts else None,
+        # "mean_ttft_ms": float(np.mean(ttfts)) * 1000 if ttfts else None,
+        # "median_ttft_ms": float(np.median(ttfts)) * 1000 if ttfts else None,
+        # "p90_ttft_ms": percentile(ttfts, 90) * 1000 if ttfts else None,
+        # "p99_ttft_ms": percentile(ttfts, 99) * 1000 if ttfts else None,
 
         "mean_tpot_ms": float(np.mean(tpots)) * 1000 if tpots else None,
         "median_tpot_ms": float(np.median(tpots)) * 1000 if tpots else None,
         "p90_tpot_ms": percentile(tpots, 90) * 1000 if tpots else None,
         "p99_tpot_ms": percentile(tpots, 99) * 1000 if tpots else None,
 
-        "mean_itl_ms": float(np.mean(itls)) * 1000 if itls else None,
-        "median_itl_ms": float(np.median(itls)) * 1000 if itls else None,
-        "p90_itl_ms": percentile(itls, 90) * 1000 if itls else None,
-        "p99_itl_ms": percentile(itls, 99) * 1000 if itls else None,
+        # "mean_itl_ms": float(np.mean(itls)) * 1000 if itls else None,
+        # "median_itl_ms": float(np.median(itls)) * 1000 if itls else None,
+        # "p90_itl_ms": percentile(itls, 90) * 1000 if itls else None,
+        # "p99_itl_ms": percentile(itls, 99) * 1000 if itls else None,
 
         "mean_e2el_ms": float(np.mean(latencies)) * 1000 if latencies else None,
         "median_e2el_ms": float(np.median(latencies)) * 1000 if latencies else None,
@@ -356,19 +365,8 @@ async def send_request(
                 tokenizer(text, add_special_tokens=False).input_ids
             )
 
-            # ---------------------------
-            # Approx timing model
-            # ---------------------------
-            if output_tokens > 0:
-                ttft = 0.001
-                if output_tokens > 1:
-                    per_token = (latency - ttft) / (output_tokens - 1)
-                    itl = [per_token] * (output_tokens - 1)
-                else:
-                    itl = []
-            else:
-                ttft = latency
-                itl = []
+            ttft=latency
+            itl= [latency/output_tokens-1] if output_tokens>1 else [latency]
 
             return (
                 RequestMetrics(
@@ -407,7 +405,7 @@ async def send_stateful_request(
     model_name,
     tokenizer,
     conversation_state: dict,
-    max_tokens=100,
+    max_tokens=2048,
     temperature=0.0,
     ):
     # Setup your model's maximum limit (matching your 40k max-model-len in vLLM)
@@ -577,8 +575,18 @@ async def run_programs(
 
                 req_metrics.append(rm)
                 pbar.update(1)
-
-            return ProgramMetrics(program_id=pid, requests=req_metrics)
+                async with session.get(f"{base_url}/prog_time/{pid}") as response:
+                    # The response is a JSON list containing the two values
+                    data = await response.json()
+                    if data[0] is not None:
+                        waiting_time = float(data[0])
+                    else:
+                        waiting_time=-1
+                    if data[1] is not None:
+                        service_time = float(data[1])
+                    else:
+                        waiting_time=-1
+            return ProgramMetrics(program_id=pid, requests=req_metrics, waiting_time=waiting_time, service_time=service_time)
 
         # ----------------------------
         # Launch programs concurrently
@@ -618,8 +626,13 @@ async def benchmark_sharegpt(
 ):
     print(f"Is baseline run: {is_baseline}")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-
+    try:
+        # Attempt to load the primary model's tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model_name, model_max_length=10000)
+        
+    except Exception as e:
+        from transformers import GPT2Tokenizer
+        tokenizer = GPT2Tokenizer.from_pretrained("gpt2", model_max_length=10000)
     with open(dataset_path, "r", encoding="utf8") as f:
         data = json.load(f)
 
@@ -627,7 +640,7 @@ async def benchmark_sharegpt(
     # print("\n============================================")
     # print(f"Loaded {len(data)} programs from ShareGPT dataset")
     # print("============================================\n")
-
+    print(len(data))
     program_requests = []
     for conv in data:
         if(len(program_requests)>=limit):
@@ -693,10 +706,45 @@ async def benchmark_sharegpt(
         dtype=float
     )
 
+    
     if e2el_values.size:
         full_metrics["mean_e2el_per_program"] = float(np.mean(e2el_values))
         full_metrics["median_e2el_per_program"] = float(np.median(e2el_values))
+        full_metrics["p95_e2el_per_program"] = float(np.percentile(e2el_values, 95))
         full_metrics["p99_e2el_per_program"] = float(np.percentile(e2el_values, 99))
+
+    ttft_values = np.array(
+        [p["prog_ttft_s"] for p in per_program_metrics if p.get("prog_ttft_s") is not None],
+        dtype=float
+    )
+    if ttft_values.size:
+        full_metrics["mean_ttft_per_program"] = float(np.mean(ttft_values))
+        full_metrics["median_ttft_per_program"] = float(np.median(ttft_values))
+        full_metrics["p95_ttft_per_program"] = float(np.percentile(ttft_values, 95))
+        full_metrics["p99_ttft_per_program"] = float(np.percentile(ttft_values, 99))
+    
+    waiting_time = np.array(
+        [p["waiting_time_s"] for p in per_program_metrics if p.get("waiting_time_s") is not None],
+        dtype=float
+    )
+    if waiting_time.size:
+        full_metrics["mean_waiting_time_per_program"] = float(np.mean(waiting_time))
+        full_metrics["median_waiting_time_per_program"] = float(np.median(waiting_time))
+        full_metrics["p95_waiting_time_per_program"] = float(np.percentile(waiting_time, 95))
+        full_metrics["p99_waiting_time_per_program"] = float(np.percentile(waiting_time, 99))
+        full_metrics["total_waiting_time_s"] = float(np.sum(waiting_time))
+
+    service_time = np.array(
+        [p["service_time_s"] for p in per_program_metrics if p.get("service_time_s") is not None],
+        dtype=float
+    )
+    if service_time.size:
+        full_metrics["mean_service_time_per_program"] = float(np.mean(service_time))
+        full_metrics["median_service_time_per_program"] = float(np.median(service_time))
+        full_metrics["p95_service_time_per_program"] = float(np.percentile(service_time, 95))
+        full_metrics["p99_service_time_per_program"] = float(np.percentile(service_time, 99))
+        full_metrics["total_service_time_s"] = float(np.sum(service_time))
+
 
 
     full_metrics["total_e2el_s"] = total_wall
@@ -837,7 +885,7 @@ if __name__ == "__main__":
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--max-concurrency", type=int, default=100)
+    parser.add_argument("--max-concurrency", type=int, default=-1)
     parser.add_argument("--request-rate", type=float, default=float("inf"))
     parser.add_argument("--burstiness", type=float, default=1.0)
     parser.add_argument("--output-json", type=str, default=None)

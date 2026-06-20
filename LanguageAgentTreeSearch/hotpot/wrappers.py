@@ -7,7 +7,7 @@ import string
 from collections import Counter
 
     
-DATA_DIR = "data"
+DATA_DIR = "LanguageAgentTreeSearch/hotpot/data"
 HOTPOTQA_SPLIT_FILE = {
   "train": "hotpot_train_v1.1_simplified.json",
   "dev": "hotpot_dev_v1_simplified.json",

@@ -1,10 +1,14 @@
 #!/bin/bash
 # START VLLM SERVERS
-
-source /opt/conda/etc/profile.d/conda.sh && conda activate proxy_server
+export HF_HOME="/mnt/scratch/global/huggingface_cache/huggingface"
+source /opt/miniconda/etc/profile.d/conda.sh
+conda activate /mnt/scratch/scheduler/envs/proxy_server
 set -x
 
-# ## arruma um dos warning, mas nao entendi direito
+
+# ============================================================
+# Global Configuration
+# ============================================================
 FLASHINFER_DIR="/opt/conda/envs/proxy_server/lib/python3.12/site-packages/flashinfer/data/include/flashinfer/comm"
 
 echo "[INFO] Verificando e corrigindo headers do FlashInfer..."
@@ -18,39 +22,28 @@ for file in "trtllm_allreduce_fusion.cuh" "trtllm_moe_allreduce_fusion.cuh"; do
         fi
     fi
 done
-
-# ============================================================
-# Global Configuration
-# ============================================================
+rm kv_cache_usage.csv || true
 
 # Set the model name once
-rm ./kv_cache_usage.csv 2>/dev/null || true
-
 MODEL_NAME="meta-llama/Llama-3.1-8B-Instruct"
-MODEL_PATH="/scratch/hpc4ai/models/llama/Llama-3.1-8B-Instruct"
-
-
+MODEL_PATH="meta-llama/Llama-3.1-8B-Instruct"
 # Define the ports as an array. Add or remove ports here to automatically scale.
-PORTS=(8105 8106 8107 8108)
+PORTS=(8105 8106)
 
 # Shared parameters
-MAX_NUM_SEQS=256
+MAX_NUM_SEQS=10
 LOG_DIR="./var/logs"
 
 export MODEL="$MODEL_NAME"
 export MODEL_ROUTES="{
   \"$MODEL_NAME\": [
     \"http://localhost:8105\", 
-    \"http://localhost:8106\",
-    \"http://localhost:8107\",
-    \"http://localhost:8108\"
+    \"http://localhost:8106\"
   ]
 }"
 export BACKEND_PARALLELISM='{
-  "http://localhost:8105": 256, 
-  "http://localhost:8106": 256,
-  "http://localhost:8107": 256,
-  "http://localhost:8108": 256
+  "http://localhost:8105": 10, 
+  "http://localhost:8106": 10
 }'
 
 # ============================================================
@@ -87,7 +80,7 @@ for PORT in "${PORTS[@]}"; do
         --max-num-seqs "$MAX_NUM_SEQS" \
         --dtype bfloat16 \
         --max-model-len 40000 \
-        --gpu-memory-utilization 0.45 \
+        --gpu-memory-utilization 0.9 \
         --served-model-name $MODEL_NAME \
         2>&1 | tee "$LOG_DIR/saida_VLLM_${PORT}.txt" &
         
@@ -98,23 +91,16 @@ for PORT in "${PORTS[@]}"; do
     eval "echo '[INFO] Engine $PORT assigned to PID${ENGINE_IDX}=\$PID${ENGINE_IDX}'"
         
     wait_for_ready "$PORT"
-    if (( ENGINE_IDX % 2 == 0 )); then
-        GPU=$((GPU + 1))
-    fi
+    GPU=$((GPU + 1))
+
     ENGINE_IDX=$((ENGINE_IDX + 1))
 done
 # ============================================================
 # Benchmark Setup
 # ============================================================
 BASE_URL="http://localhost:8081"
-#trocar para local na scratch
-DATASET="./ShareGPT_V3_unfiltered_cleaned_split.json"
-
-if [ ! -f "$DATASET" ]; then
-    echo "[INFO] Downloading dataset..."
-    curl -L https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json -o "$DATASET"
-fi
-
+export CUSTOM_API_BASE="$BASE_URL"
+export CUSTOM_MODEL="$MODEL_NAME"
 # ============================================================
 # Engines (metrics + reset) dynamically generated from PORTS
 # ============================================================
@@ -130,12 +116,17 @@ done
 # Experiment grid
 # ============================================================
 MODEL="$MODEL_NAME"
-LIMIT=66400 #numero de conversas do share gpt (num programas)
-OUTPUTS_DIR="outputs/teste"
+ALGORITHM="lats"
+START_INDEX=900
+END_INDEX=903
+ITERATIONS=3
+N_GENERATE=2
+N_EVALUATE=1
+OUTPUTS_DIR="outputs_lats/teste1"
 mkdir -p "$OUTPUTS_DIR"
-CHAT_LEN=-1 #tamanho fixo das conversas, se -1 pega de qualquer
+
 REPEATS=1
-RATES=("1000")
+RATES=("4" "8")
 # RATES=("0.5" "1" "2" "4" "8")
 BURSTINESS=1
 
@@ -152,9 +143,9 @@ LB_CONFIGS=(
 #   "least-waiting:N/A:0"
 #   "least-running:N/A:0"
 #   "least-kv-cache:N/A:0"
-#   "autellix:N/A:0"
-#   "threshold-autellix:total:15"
-#   "threshold-autellix:running:10"
+  "autellix:N/A:0"
+  "threshold-autellix:total:15"
+  "threshold-autellix:running:10"
 #   "threshold-autellix:kv_cache_percent:90"
 )
 
@@ -201,7 +192,6 @@ get_prefix_metrics_per_engine() {
         }
     }'
 }
-
 # ============================================================
 # baseline LOOP
 # ============================================================
@@ -247,17 +237,18 @@ for sched_conf in "${SCHEDULER_CONFIGS[@]}"; do
             done
             OUTPUT_JSON="${OUTPUTS_DIR}/baseline_output_${sched_suffix}_round-robin_rate${rate}_run${RUN}.json"
             OUTPUT_KV_CACHE="${OUTPUTS_DIR}/baseline_output_${sched_suffix}_round-robin_rate${rate}_run${RUN}_kv_cache.csv"
-            python benchmark_stateful.py \
-                --base-url "$BASE_URL" \
-                --dataset "$DATASET" \
-                --model "$MODEL" \
-                --limit "$LIMIT" \
-                --request-rate "$rate" \
-                --mode "chat" \
-                --output-json "$OUTPUT_JSON" \
-                --chat_len "$CHAT_LEN" \
-                --is_baseline_run 1 \
-                --burstiness $BURSTINESS
+
+            python LanguageAgentTreeSearch/hotpot/run.py \
+                --algorithm $ALGORITHM \
+                --task_start_index $START_INDEX \
+                --task_end_index $END_INDEX \
+                --iterations $ITERATIONS \
+                --n_generate_sample $N_GENERATE \
+                --n_evaluate_sample $N_EVALUATE \
+                --output-json $OUTPUT_JSON \
+                --burstiness $BURSTINESS \
+                --program-rate "$rate" \
+                --is_baseline_run 1
         done
         #Matando o proxy
         echo "Stopping proxy (PID=$PROXY_PID)"
@@ -385,20 +376,20 @@ for sched_conf in "${SCHEDULER_CONFIGS[@]}"; do
                         before_h[$engine]=$h
                     done < <(get_prefix_metrics_per_engine "$url")
                 done
+                # cd /mnt/scratch/scheduler/proxy_server/LanguageAgentTreeSearch/hotpot
                 OUTPUT_JSON="${OUTPUTS_DIR}/output_${sched_suffix}_${strat_suffix}_rate${rate}_run${RUN}.json"
                 OUTPUT_KV_CACHE="${OUTPUTS_DIR}/output_${sched_suffix}_${strat_suffix}_rate${rate}_run${RUN}_kv_cache.csv"
-                python benchmark_stateful.py \
-                    --base-url "$BASE_URL" \
-                    --dataset "$DATASET" \
-                    --model "$MODEL" \
-                    --limit "$LIMIT" \
-                    --request-rate "$rate" \
-                    --mode "chat" \
-                    --output-json "$OUTPUT_JSON" \
-                    --chat_len "$CHAT_LEN" \
-                    --is_baseline_run 0 \
-                    --burstiness $BURSTINESS
-
+                python LanguageAgentTreeSearch/hotpot/run.py \
+                    --algorithm $ALGORITHM \
+                    --task_start_index $START_INDEX \
+                    --task_end_index $END_INDEX \
+                    --iterations $ITERATIONS \
+                    --n_generate_sample $N_GENERATE \
+                    --n_evaluate_sample $N_EVALUATE \
+                    --output-json $OUTPUT_JSON \
+                    --burstiness $BURSTINESS \
+                    --program-rate "$rate" \
+                    --is_baseline_run 0
                 # ------------------------------------
                 # AFTER metrics + compute delta
                 # ------------------------------------
@@ -479,4 +470,4 @@ echo "All benchmarks completed successfully."
 echo "======================================"
 
 echo "[INFO] Stopping vLLM engines..."
-kill "$PID1" "$PID2" "$PID3" "$PID4" 2>/dev/null || true
+kill "$PID1" "$PID2" 2>/dev/null || true

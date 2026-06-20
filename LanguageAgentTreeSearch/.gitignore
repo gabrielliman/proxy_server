@@ -6,3 +6,5 @@ dist/
 **/logs
 .venv/
 .vscode/
+/hotpot/results
+.log

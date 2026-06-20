@@ -11,11 +11,12 @@ HEADERS = [
     "model_name",
     "kv_cache_percent",
     "running",
-    "waiting"
+    "waiting",
+    "incomplete_count",
+    "proxy_waiting_count"
 ]
 
-
-def log_kv_cache(backend_url, kv_list):
+def log_kv_cache(backend_url, kv_list, global_incomplete: int = 0, global_proxy_waiting: int = 0):
     if not kv_list:
         return
 
@@ -37,5 +38,7 @@ def log_kv_cache(backend_url, kv_list):
                 kv["model_name"],
                 kv["kv_cache"],
                 kv.get("running", 0),
-                kv.get("waiting", 0)
+                kv.get("waiting", 0),
+                global_incomplete,
+                global_proxy_waiting 
             ])

@@ -4,7 +4,8 @@ source "/mnt/scratch/scheduler/proxy_server/.env"
 export HF_HOME="/mnt/scratch/global/huggingface_cache/huggingface"
 
 # Paths and ports
-MODEL1_NAME="/mnt/scratch/global/huggingface_cache/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659"
+MODEL1_NAME="meta-llama/Llama-3.1-8B-Instruct"
+# MODEL1_NAME="/mnt/scratch/global/huggingface_cache/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659"
 MODEL2_NAME="meta-llama/Llama-3.1-8B-Instruct"
 # MODEL3_NAME="meta-llama/Llama-3.1-8B-Instruct"
 # "meta-llama/Llama-3.1-8B-Instruct"
@@ -13,7 +14,6 @@ MODEL2_NAME="meta-llama/Llama-3.1-8B-Instruct"
 # "Qwen/Qwen3-0.6B"
 # "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
 
-EMBEDDING_PORT=8001
 MODEL1_PORT=8105
 MODEL2_PORT=8106
 #MODEL3_PORT=8007
@@ -52,7 +52,7 @@ CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.openai.api_server --model "$MO
 PID1=$!
 wait_for_ready $MODEL1_PORT
 
-# CUDA_VISIBLE_DEVICES=0 python -u -m vllm.entrypoints.openai.api_server --model "$MODEL2_NAME" --port $MODEL2_PORT --max-num-seqs $MODEL2_MAX_NUM_SEQS --dtype bfloat16 --max-model-len 40000 --gpu-memory-utilization 0.9 2>&1 | tee "$LOG_DIR/saida_VLLM_$MODEL2_PORT.txt" &
+# CUDA_VISIBLE_DEVICES=1 python -u -m vllm.entrypoints.openai.api_server --model "$MODEL2_NAME" --port $MODEL2_PORT --max-num-seqs $MODEL2_MAX_NUM_SEQS --dtype bfloat16 --max-model-len 40000 --gpu-memory-utilization 0.9 2>&1 | tee "$LOG_DIR/saida_VLLM_$MODEL2_PORT.txt" &
 # PID2=$!
 # wait_for_ready $MODEL2_PORT
 

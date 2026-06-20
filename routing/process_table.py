@@ -284,7 +284,43 @@ class ProcessTable:
             }
 
         return snapshot
+    
+    def get_waiting_time(self, program_id: str) -> Optional[float]:
+        """Return total waiting time for a program, or None if not found."""
+        with self.lock:
+            entry = self.table.get(program_id)
+            if not entry:
+                return None
+            return entry.get("waiting_time_cumulative", 0.0)
+    
+    def get_service_time(self, program_id: str) -> Optional[float]:
+        """Return total service time for a program, or None if not found."""
+        with self.lock:
+            entry = self.table.get(program_id)
+            if not entry:
+                return None
+            return entry.get("service_time_cumulative", 0.0)
 
+    def get_incomplete_requests_count(self) -> int:
+        """Retorna o número total de requisições (threads) que ainda não foram concluídas."""
+        count = 0
+        with self.lock:
+            for entry in self.table.values():
+                for th in entry.get("threads", {}).values():
+                    if th.get("state") in ("waiting", "running"):
+                        count += 1
+        return count
+    
+    def get_waiting_requests_count(self) -> int:
+        """Retorna o número total de requisições (threads) que estão esperando."""
+        count = 0
+        with self.lock:
+            for entry in self.table.values():
+                for th in entry.get("threads", {}).values():
+                    if th.get("state") == "waiting":
+                        count += 1
+        return count
+    
     def prune_stale(self, ttl_seconds: float) -> List[str]:
         """Remove processes that have no waiting/running threads and whose
         most recent call arrival is older than ttl_seconds. Returns list of removed ids.

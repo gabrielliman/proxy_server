@@ -1,3 +1,4 @@
+import json
 import os
 from dotenv import load_dotenv
 
@@ -5,28 +6,28 @@ load_dotenv()
 
 # CONFIGURE AQUI
 HF_TOKEN = os.getenv("HF_TOKEN")
-MODEL ="meta-llama/Llama-3.3-70B-Instruct"
-MODEL_ROUTES = {
-    # "Qwen/Qwen3-4B": [
-    #     "http://localhost:8105",
-    #     # "http://localhost:8105"
-    # ],
-    
-    # "meta-llama/Llama-3.1-8B-Instruct": [
-    #     "http://localhost:8105",
-    #     "http://localhost:8106"
-    # ],
-    "meta-llama/Llama-3.3-70B-Instruct": [
+# 1. Simple string fallback (just like PLAS_METRIC_TYPE)
+MODEL = os.getenv("MODEL", "meta-llama/Llama-3.1-8B-Instruct")
+
+# 2. Dictionary fallback for MODEL_ROUTES
+_default_model_routes = {
+    "meta-llama/Llama-3.1-8B-Instruct": [
         "http://localhost:8105",
         "http://localhost:8106"
-    ]
+    ],
 }
+_env_model_routes = os.getenv("MODEL_ROUTES")
+# If the env var exists, parse it from JSON. Otherwise, use the default dict.
+MODEL_ROUTES = json.loads(_env_model_routes) if _env_model_routes else _default_model_routes
 
-#nao funciona para o endpoint completions
-BACKEND_PARALLELISM = {
-    "http://localhost:8105": 1000, #rodar sem limite de paralelismo
-    "http://localhost:8106": 1000,
+# 3. Dictionary fallback for BACKEND_PARALLELISM
+# nao funciona para o endpoint completions
+_default_backend_parallelism = {
+    "http://localhost:8105": 10,
+    "http://localhost:8106": 10,
 }
+_env_backend_parallelism = os.getenv("BACKEND_PARALLELISM")
+BACKEND_PARALLELISM = json.loads(_env_backend_parallelism) if _env_backend_parallelism else _default_backend_parallelism
 
 ALL_BACKENDS = sorted({url for lst in MODEL_ROUTES.values() for url in lst})
 
