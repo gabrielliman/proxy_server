@@ -6,7 +6,6 @@ import time
 from routing.dispatcher.base import BaseDispatcher
 from routing.queue_manager import get_queue, put_request, get_request
 from config.settings import REQUEST_TIMEOUT, BACKEND_PARALLELISM, ALL_BACKENDS, SCHEDULER, MODEL
-from routing.scheduler_plas import compute_priority
 from utils.tokenizer_utils import get_tokenizer
 
 class WorkerPoolDispatcher(BaseDispatcher):
@@ -42,7 +41,7 @@ class WorkerPoolDispatcher(BaseDispatcher):
         # REMOVIDO: async with httpx.AsyncClient(...) as client:
         # Agora usamos o cliente global diretamente no loop infinito
         while True:
-            if SCHEDULER == "plas":
+            if SCHEDULER in ("plas", "atlas"):
                 item = await get_request(backend)
             else:
                 item = await queue.get()
@@ -92,7 +91,7 @@ class WorkerPoolDispatcher(BaseDispatcher):
                 if pid and cid:
                     PROCESS_TABLE.record_call_completion(pid, cid, completion_time=end, output_tokens=output_tokens)
                 # call task_done if supported (asyncio.Queue)
-                if hasattr(queue, "task_done") and not SCHEDULER == "plas":
+                if hasattr(queue, "task_done") and SCHEDULER not in ("plas", "atlas"):
                     queue.task_done()
 
     async def dispatch(self, backend: str, data: dict, program_id: str = None, call_id: str = None) -> dict:
@@ -107,12 +106,18 @@ class WorkerPoolDispatcher(BaseDispatcher):
             PROCESS_TABLE.record_enqueue(program_id, call_id)
 
         item = {"data": data, "future": future, "program_id": program_id, "call_id": call_id}
-        if SCHEDULER == "plas":
+        if SCHEDULER in ("plas", "atlas"):
             from config.settings import ANTI_STARVATION_RATIO_THRESHOLD
             if program_id and PROCESS_TABLE.should_promote_to_q1(program_id, ANTI_STARVATION_RATIO_THRESHOLD):
                 PROCESS_TABLE.reset_wait_and_service_for_promotion(program_id)
                 await put_request(backend, 0.0, item)
             else:
+                # Dynamically load the correct priority function
+                if SCHEDULER == "atlas":
+                    from routing.scheduler_atlas import compute_priority
+                else:
+                    from routing.scheduler_plas import compute_priority
+                    
                 priority, seq = compute_priority(program_id, call_id)
                 await put_request(backend, priority, item)
         else:

@@ -24,6 +24,10 @@ async def processes():
     print("Fetching process table snapshot")
     return PROCESS_TABLE.list_processes()
 
+@router.get("/processes_summary")
+async def processes_summary():
+    print("Fetching process table summary")
+    return PROCESS_TABLE.sum_processes()
 
 @router.get("/waiting_time/{program_id}")
 async def get_waiting_time(program_id: str):

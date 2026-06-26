@@ -1,13 +1,14 @@
 export CUSTOM_API_BASE="http://localhost:8081"
 export CUSTOM_MODEL="meta-llama/Llama-3.1-8B-Instruct"
-python run.py \
+python LanguageAgentTreeSearch/hotpot/run.py \
   --algorithm lats \
   --task_start_index 900 \
   --task_end_index 902 \
   --iterations 3 \
   --log logs/lats_smoke_test.log \
-  --n_generate_sample 10 \
+  --n_generate_sample 30 \
   --n_evaluate_sample 1 \
+  --program-rate 0.5
 # python run.py \
 #     --backend gpt-3.5-turbo \
 #     --task_start_index 0 \

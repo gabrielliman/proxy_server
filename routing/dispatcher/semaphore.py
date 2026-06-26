@@ -1,5 +1,5 @@
 # routing/dispatcher/semaphore.py
-
+# NOT ADAPTED TO ATLAS (follow worker to do it)
 import asyncio
 import httpx
 import time

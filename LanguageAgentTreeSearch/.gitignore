@@ -7,4 +7,4 @@ dist/
 .venv/
 .vscode/
 /hotpot/results
-.log
+*.log

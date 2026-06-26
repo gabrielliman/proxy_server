@@ -3,7 +3,7 @@ version: 1.1
 kind: operation
 tags: [examples, bash]
 queue: axia/default
-name: lats_burstiness05
+name: atlas_service_100prog_50it_5gen_rate8_bur01_1threshold
 component:
   kind: component
   run:
@@ -23,11 +23,11 @@ component:
       # storage local da axia, /scratch, que pode ser usado por qualquer
       # job ou usuário.
       # command: ["bash", "-c", "set -x; pwd; ls; ls /scratch; bash my_script.sh"]
-      command: ["bash", "-c", "set -x; pwd; ls; ls /scratch; bash polyaxon_lats_benchmark.sh"]
+      command: ["bash", "-c", "set -x; nvidia-smi; bash polyaxon_new_lats_benchmark.sh"]
       # command: ["bash", "-c", "set -x; pwd; ls; ls /scratch;"]
       # Defina ambos 'requests' e 'limits' para asegurar alocação exclusiva.
       resources:
         requests:
-          nvidia.com/gpu: 1
+          nvidia.com/gpu: 4
         limits:
-          nvidia.com/gpu: 1
+          nvidia.com/gpu: 4

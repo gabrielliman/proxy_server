@@ -66,14 +66,22 @@ wait_for_ready() {
 export VLLM_SERVER_DEV_MODE=1
 echo "[INFO] Starting vLLM inference servers"
 
-# Loop through the PORTS array and start a server for each
+# 1. Declare an array to hold the PIDs globally
+VLLM_PIDS=()
 GPU=0
-ENGINE_IDX=1  # Counter to create PID1, PID2, etc.
+
+cleanup_engines() {
+    echo "[CLEANUP] Automatically terminating vLLM engines..."
+    if [ ${#VLLM_PIDS[@]} -gt 0 ]; then
+        kill "${VLLM_PIDS[@]}" 2>/dev/null || true
+    fi
+}
+# Trap normal exits (0), Ctrl+C (2), and error exits (15)
+trap cleanup_engines EXIT INT TERM
 
 for PORT in "${PORTS[@]}"; do
     echo "[INFO] Booting server on port $PORT..."
     
-    # Your exact pipeline syntax
     CUDA_VISIBLE_DEVICES=$GPU python -u -m vllm.entrypoints.openai.api_server \
         --model "$MODEL_PATH" \
         --port "$PORT" \
@@ -81,19 +89,16 @@ for PORT in "${PORTS[@]}"; do
         --dtype bfloat16 \
         --max-model-len 40000 \
         --gpu-memory-utilization 0.9 \
-        --served-model-name $MODEL_NAME \
-        2>&1 | tee "$LOG_DIR/saida_VLLM_${PORT}.txt" &
+        --served-model-name "$MODEL_NAME" \
+        > >(tee "$LOG_DIR/saida_VLLM_${PORT}.txt") 2>&1 &
         
-    # This executes exactly as: PID1=$!, PID2=$!, etc.
-    eval "PID${ENGINE_IDX}=\$!"
+    # 2. Append the actual Python process PID to our array
+    VLLM_PIDS+=($!)
     
-    # Print verification showing the variable name and value
-    eval "echo '[INFO] Engine $PORT assigned to PID${ENGINE_IDX}=\$PID${ENGINE_IDX}'"
+    echo "[INFO] Engine $PORT assigned to PID: $!"
         
     wait_for_ready "$PORT"
     GPU=$((GPU + 1))
-
-    ENGINE_IDX=$((ENGINE_IDX + 1))
 done
 # ============================================================
 # Benchmark Setup
@@ -118,35 +123,41 @@ done
 MODEL="$MODEL_NAME"
 ALGORITHM="lats"
 START_INDEX=900
-END_INDEX=903
-ITERATIONS=3
+END_INDEX=902
+ITERATIONS=1
 N_GENERATE=2
 N_EVALUATE=1
-OUTPUTS_DIR="outputs_lats/teste1"
+OUTPUTS_DIR="outputs_lats/teste5"
 mkdir -p "$OUTPUTS_DIR"
 
 REPEATS=1
-RATES=("4" "8")
+RATES=("8")
 # RATES=("0.5" "1" "2" "4" "8")
 BURSTINESS=1
 
 # Format: "scheduler_name:plas_metric_type"
 SCHEDULER_CONFIGS=(
-  "fcfs:N/A"
-#   "plas:service_ewma"
-#   "plas:kv_token_time"
+    # "fcfs:N/A"
+    # "plas:service_cumulative"
+    # "plas:kv_token_time"
+    # "atlas:service_cumulative"
+    "atlas:kv_token_time"
+
 ) 
 
 # Format: "strategy_name:threshold_metric:threshold_value"
 LB_CONFIGS=(
-  "least-total-load:N/A:0"
-#   "least-waiting:N/A:0"
-#   "least-running:N/A:0"
-#   "least-kv-cache:N/A:0"
-  "autellix:N/A:0"
-  "threshold-autellix:total:15"
-  "threshold-autellix:running:10"
-#   "threshold-autellix:kv_cache_percent:90"
+    # "least-total-load:N/A:0"
+    # "least-waiting:N/A:0"
+    # "least-running:N/A:0"
+    # "least-kv-cache:N/A:0"
+    # "autellix:N/A:0"
+    # "threshold-autellix:total:15"
+    "threshold-autellix:running:10"
+    # "threshold-autellix:kv_cache_percent:90"
+    "ordered-dynamic-autellix:N/A:0"
+    # "least-load-dynamic-autellix:N/A:0"
+    # "probabilistic-cascade-autellix:N/A:0"
 )
 
 # ============================================================
@@ -155,19 +166,14 @@ LB_CONFIGS=(
 
 get_prefix_metrics_per_engine() {
     local url=$1
+    local port=$2 # Accept the port number
 
-    curl -s "$url" | awk '
-
+    curl -s "$url" | awk -v port="$port" '
     /^vllm:prefix_cache_queries_total\{/ {
-        # Standard 2-arg match finds the starting position (RSTART) and length (RLENGTH)
         if (match($0, /engine="[^"]+"/)) {
-            # Extract exactly engine="<name>"
             engine_str = substr($0, RSTART, RLENGTH)
-            # Split by double quotes to get the actual name
             split(engine_str, parts, /"/)
             engine = parts[2]
-            
-            # In Prometheus metrics, the value is always the last field ($NF)
             queries[engine] = $NF
         }
     }
@@ -177,7 +183,6 @@ get_prefix_metrics_per_engine() {
             engine_str = substr($0, RSTART, RLENGTH)
             split(engine_str, parts, /"/)
             engine = parts[2]
-            
             hits[engine] = $NF
         }
     }
@@ -187,8 +192,8 @@ get_prefix_metrics_per_engine() {
             q = queries[e] + 0
             h = (e in hits ? hits[e] : 0) + 0
 
-            # MACHINE READABLE (important!)
-            printf "%s %f %f\n", e, q, h
+            # Prepend the port to the engine to guarantee uniqueness
+            printf "%s_%s %f %f\n", port, e, q, h
         }
     }'
 }
@@ -201,7 +206,7 @@ for sched_conf in "${SCHEDULER_CONFIGS[@]}"; do
 
     # Create a clear string for the JSON filename
     sched_suffix=$scheduler
-    if [ "$scheduler" == "plas" ]; then
+    if [ "$scheduler" = "plas" ] || [ "$scheduler" = "atlas" ]; then
         sched_suffix="${scheduler}_${plas_metric}"
     fi
 
@@ -229,11 +234,12 @@ for sched_conf in "${SCHEDULER_CONFIGS[@]}"; do
             declare -A before_q
             declare -A before_h
 
-            for url in "${PREFIX_URL[@]}"; do
+            for PORT in "${PORTS[@]}"; do
+                url="http://localhost:${PORT}/metrics"
                 while read -r engine q h; do
                     before_q[$engine]=$q
                     before_h[$engine]=$h
-                done < <(get_prefix_metrics_per_engine "$url")
+                done < <(get_prefix_metrics_per_engine "$url" "$PORT")
             done
             OUTPUT_JSON="${OUTPUTS_DIR}/baseline_output_${sched_suffix}_round-robin_rate${rate}_run${RUN}.json"
             OUTPUT_KV_CACHE="${OUTPUTS_DIR}/baseline_output_${sched_suffix}_round-robin_rate${rate}_run${RUN}_kv_cache.csv"
@@ -251,6 +257,8 @@ for sched_conf in "${SCHEDULER_CONFIGS[@]}"; do
                 --is_baseline_run 1
         done
         #Matando o proxy
+        PROG_FILE="${OUTPUTS_DIR}/baseline_processes_summary_${sched_suffix}_round-robin_rate${rate}_run${RUN}.json"
+        curl -s "${BASE_URL}/processes_summary" | python3 -m json.tool > "$PROG_FILE"
         echo "Stopping proxy (PID=$PROXY_PID)"
         kill "$PROXY_PID"
         wait "$PROXY_PID" 2>/dev/null || true
@@ -259,15 +267,18 @@ for sched_conf in "${SCHEDULER_CONFIGS[@]}"; do
 
         declare -A prefix_json_map
 
-        for url in "${PREFIX_URL[@]}"; do
-            while read engine q h; do
+        for PORT in "${PORTS[@]}"; do
+            url="http://localhost:${PORT}/metrics"
+            while read -r engine q h; do
                 before_queries=${before_q[$engine]:-0}
                 before_hits=${before_h[$engine]:-0}
-                dq=$(echo "$q - $before_queries" | bc)
-                dh=$(echo "$h - $before_hits" | bc)
-                hr=$(awk -v dh="$dh" -v dq="$dq" 'BEGIN { if (dq>0) printf "%.6f", dh/dq; else print 0 }')
-                prefix_json_map[$engine]="{\"queries\":$dq,\"hits\":$dh,\"hit_rate\":$hr}"
-            done < <(get_prefix_metrics_per_engine "$url")
+
+                dq=$(awk -v q="${q:-0}" -v bq="${before_queries:-0}" 'BEGIN { print q - bq }')
+                dh=$(awk -v h="${h:-0}" -v bh="${before_hits:-0}" 'BEGIN { print h - bh }')
+                hr=$(awk -v dh="${dh:-0}" -v dq="${dq:-0}" 'BEGIN { if (dq>0) printf "%.6f", dh/dq; else print 0 }')
+
+                prefix_json_map[$engine]="{\"queries\":${dq:-0},\"hits\":${dh:-0},\"hit_rate\":${hr:-0}}"
+            done < <(get_prefix_metrics_per_engine "$url" "$PORT")
         done
 
         # ------------------------------------
@@ -288,24 +299,32 @@ for sched_conf in "${SCHEDULER_CONFIGS[@]}"; do
         # ------------------------------------
         # Inject into benchmark JSON
         # ------------------------------------
-        tmp=$(mktemp)
+        python3 -c '
+import sys, json
 
-        jq \
-        --argjson prefix "$prefix_json" \
-        --arg scheduler "$sched_suffix" \
-        --arg strategy "round-robin" \
-        --arg rate "$rate" \
-        --arg num_conversations "$LIMIT" \
-        '
-        .full_metrics.prefix_cache = $prefix
-        | .full_metrics.scheduler = $scheduler
-        | .full_metrics.load_balancer = $strategy
-        | .full_metrics.request_rate = ($rate | tonumber)
-        | .full_metrics.num_conversations = ($num_conversations | tonumber)
-        ' "$OUTPUT_JSON" > "$tmp" && mv "$tmp" "$OUTPUT_JSON"
+file_path = sys.argv[1]
+prefix_data = json.loads(sys.argv[2])
+scheduler = sys.argv[3]
+strategy = sys.argv[4]
+rate = float(sys.argv[5])
+start = int(sys.argv[6])
+end = int(sys.argv[7])
 
-        echo "Metrics injected into JSON"
-        echo "--------------------------------------"
+with open(file_path, "r") as f:
+    data = json.load(f)
+
+if "full_metrics" not in data:
+    data["full_metrics"] = {}
+
+data["full_metrics"]["prefix_cache"] = prefix_data
+data["full_metrics"]["scheduler"] = scheduler
+data["full_metrics"]["load_balancer"] = strategy
+data["full_metrics"]["request_rate"] = rate
+data["full_metrics"]["num_conversations"] = end-start
+
+with open(file_path, "w") as f:
+    json.dump(data, f, indent=2)
+' "$OUTPUT_JSON" "$prefix_json" "$sched_suffix" "round-robin" "$rate" "$START_INDEX" "$END_INDEX"
 
     done
 done
@@ -318,7 +337,7 @@ for sched_conf in "${SCHEDULER_CONFIGS[@]}"; do
     IFS=':' read -r scheduler plas_metric <<< "$sched_conf"
 
     sched_suffix=$scheduler
-    if [ "$scheduler" == "plas" ]; then
+    if [ "$scheduler" = "plas" ] || [ "$scheduler" = "atlas" ]; then
         sched_suffix="${scheduler}_${plas_metric}"
     fi
 
@@ -370,11 +389,12 @@ for sched_conf in "${SCHEDULER_CONFIGS[@]}"; do
                 declare -A before_q
                 declare -A before_h
 
-                for url in "${PREFIX_URL[@]}"; do
+                for PORT in "${PORTS[@]}"; do
+                    url="http://localhost:${PORT}/metrics"
                     while read -r engine q h; do
                         before_q[$engine]=$q
                         before_h[$engine]=$h
-                    done < <(get_prefix_metrics_per_engine "$url")
+                    done < <(get_prefix_metrics_per_engine "$url" "$PORT")
                 done
                 # cd /mnt/scratch/scheduler/proxy_server/LanguageAgentTreeSearch/hotpot
                 OUTPUT_JSON="${OUTPUTS_DIR}/output_${sched_suffix}_${strat_suffix}_rate${rate}_run${RUN}.json"
@@ -395,19 +415,18 @@ for sched_conf in "${SCHEDULER_CONFIGS[@]}"; do
                 # ------------------------------------
                 declare -A prefix_json_map
 
-                for url in "${PREFIX_URL[@]}"; do
-                    while read engine q h; do
-
+                for PORT in "${PORTS[@]}"; do
+                    url="http://localhost:${PORT}/metrics"
+                    while read -r engine q h; do
                         before_queries=${before_q[$engine]:-0}
                         before_hits=${before_h[$engine]:-0}
 
-                        dq=$(echo "$q - $before_queries" | bc)
-                        dh=$(echo "$h - $before_hits" | bc)
+                        dq=$(awk -v q="${q:-0}" -v bq="${before_queries:-0}" 'BEGIN { print q - bq }')
+                        dh=$(awk -v h="${h:-0}" -v bh="${before_hits:-0}" 'BEGIN { print h - bh }')
+                        hr=$(awk -v dh="${dh:-0}" -v dq="${dq:-0}" 'BEGIN { if (dq>0) printf "%.6f", dh/dq; else print 0 }')
 
-                        hr=$(awk -v dh="$dh" -v dq="$dq" 'BEGIN { if (dq>0) printf "%.6f", dh/dq; else print 0 }')
-
-                        prefix_json_map[$engine]="{\"queries\":$dq,\"hits\":$dh,\"hit_rate\":$hr}"
-                    done < <(get_prefix_metrics_per_engine "$url")
+                        prefix_json_map[$engine]="{\"queries\":${dq:-0},\"hits\":${dh:-0},\"hit_rate\":${hr:-0}}"
+                    done < <(get_prefix_metrics_per_engine "$url" "$PORT")
                 done
 
                 # ------------------------------------
@@ -427,25 +446,33 @@ for sched_conf in "${SCHEDULER_CONFIGS[@]}"; do
 
                 prefix_json+="}"
 
-                # ------------------------------------
-                # Inject into benchmark JSON
-                # ------------------------------------
-                tmp=$(mktemp)
+                python3 -c '
+import sys, json
 
-                jq \
-                --argjson prefix "$prefix_json" \
-                --arg scheduler "$sched_suffix" \
-                --arg strategy "$strat_suffix" \
-                --arg rate "$rate" \
-                --arg num_conversations "$LIMIT" \
-                '
-                .full_metrics.prefix_cache = $prefix
-                | .full_metrics.scheduler = $scheduler
-                | .full_metrics.load_balancer = $strategy
-                | .full_metrics.request_rate = ($rate | tonumber)
-                | .full_metrics.num_conversations = ($num_conversations | tonumber)
-                ' "$OUTPUT_JSON" > "$tmp" && mv "$tmp" "$OUTPUT_JSON"
+file_path = sys.argv[1]
+prefix_data = json.loads(sys.argv[2])
+scheduler = sys.argv[3]
+strategy = sys.argv[4]
+rate = float(sys.argv[5])
+start = int(sys.argv[6])
+end = int(sys.argv[7])
 
+with open(file_path, "r") as f:
+    data = json.load(f)
+
+if "full_metrics" not in data:
+    data["full_metrics"] = {}
+
+data["full_metrics"]["prefix_cache"] = prefix_data
+data["full_metrics"]["scheduler"] = scheduler
+data["full_metrics"]["load_balancer"] = strategy
+data["full_metrics"]["request_rate"] = rate
+data["full_metrics"]["num_conversations"] = end-start
+
+with open(file_path, "w") as f:
+    json.dump(data, f, indent=2)
+' "$OUTPUT_JSON" "$prefix_json" "$sched_suffix" "$strat_suffix" "$rate" "$START_INDEX" "$END_INDEX"
+                
                 echo "Metrics injected into JSON"
                 echo "--------------------------------------"
                 
@@ -455,6 +482,8 @@ for sched_conf in "${SCHEDULER_CONFIGS[@]}"; do
             # ------------------------------------
             # Stop proxy server
             # ------------------------------------
+            PROG_FILE="${OUTPUTS_DIR}/processes_summary_${sched_suffix}_${strat_suffix}_rate${rate}_run${RUN}.json"
+            curl -s "${BASE_URL}/processes_summary" | python3 -m json.tool > "$PROG_FILE"
             echo "Stopping proxy (PID=$PROXY_PID)"
             kill "$PROXY_PID"
             wait "$PROXY_PID" 2>/dev/null || true
@@ -468,6 +497,3 @@ done
 echo "======================================"
 echo "All benchmarks completed successfully."
 echo "======================================"
-
-echo "[INFO] Stopping vLLM engines..."
-kill "$PID1" "$PID2" 2>/dev/null || true

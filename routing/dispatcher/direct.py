@@ -1,5 +1,5 @@
 # routing/dispatcher_direct.py
-
+# NOT ADAPTED TO ATLAS (follow worker to do it)
 import httpx
 import time
 import asyncio

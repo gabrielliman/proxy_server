@@ -13,4 +13,5 @@ var/logs/*
 start_vllm.sh
 *.env
 .env
-.log
+*.log
+*.zip

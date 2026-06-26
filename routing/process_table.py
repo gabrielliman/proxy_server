@@ -18,6 +18,9 @@ class ProcessTable:
                     "waiting_time_cumulative": 0.0,
                     "call_count": 0,
 
+                    "active_thread_count": 0,  # <-- ADD: Threads rodando ou na fila agora
+                    "max_parallelism": 0,      # <-- ADD: Pico máximo de threads simultâneas
+
                     # KV token-time metric (d*c = pd + d²/2)
                     "kv_token_time_cumulative": 0.0,
 
@@ -28,6 +31,7 @@ class ProcessTable:
                     "preferred_engines": [],
 
                     "engine_ids": set(),
+                    "engine_request_counts": {},
                     "threads": {},
                     "most_recent_call_arrival": None,
                     "most_recent_call_completion": None,
@@ -44,6 +48,11 @@ class ProcessTable:
         self.ensure_process(program_id)
         with self.lock:
             entry = self.table[program_id]
+
+            if call_id not in entry["threads"]:
+                entry["active_thread_count"] = entry.get("active_thread_count", 0) + 1
+                entry["max_parallelism"] = max(entry.get("max_parallelism", 0), entry["active_thread_count"])
+
             entry["threads"][call_id] = {
                 "arrival_time": now,
                 "start_time": None,
@@ -69,6 +78,9 @@ class ProcessTable:
         with self.lock:
             entry = self.table[program_id]
             th = entry["threads"].get(call_id)
+
+            entry["active_thread_count"] = entry.get("active_thread_count", 0) + 1
+            entry["max_parallelism"] = max(entry.get("max_parallelism", 0), entry["active_thread_count"])
             if th is None:
                 th = {
                     "arrival_time": now,
@@ -111,6 +123,8 @@ class ProcessTable:
 
             th = entry["threads"].get(call_id)
             if th is None:
+                entry["active_thread_count"] = entry.get("active_thread_count", 0) + 1
+                entry["max_parallelism"] = max(entry.get("max_parallelism", 0), entry["active_thread_count"])
                 th = {
                     "arrival_time": now,
                     "start_time": now,
@@ -132,6 +146,9 @@ class ProcessTable:
 
             if engine_id:
                 entry["engine_ids"].add(engine_id)
+                
+                # <-- ADD THIS: Increment the request count for this specific engine
+                entry["engine_request_counts"][engine_id] = entry.get("engine_request_counts", {}).get(engine_id, 0) + 1
 
                 # 🔥 Autellix pinning rule:
                 # first long call determines program engine
@@ -195,6 +212,9 @@ class ProcessTable:
             else:
                 service = 0.0
 
+            if th.get("state") != "completed":
+                entry["active_thread_count"] = max(0, entry.get("active_thread_count", 0) - 1)
+
             th["service_time"] = service
             th["state"] = "completed"
 
@@ -247,9 +267,11 @@ class ProcessTable:
                 "service_time_cumulative": entry["service_time_cumulative"],
                 "service_time_max": entry["service_time_max"],
                 "call_count": entry.get("call_count", 0),
+                "max_parallelism": entry.get("max_parallelism", 0),
                 "waiting_time_cumulative": entry["waiting_time_cumulative"],
                 "preferred_engines": entry.get("preferred_engines", []),
                 "engine_ids": engine_ids_copy,
+                "engine_request_counts": dict(entry.get("engine_request_counts", {})),
                 "threads": threads_copy,
                 "most_recent_call_arrival": entry["most_recent_call_arrival"],
                 "most_recent_call_completion": entry["most_recent_call_completion"],
@@ -275,9 +297,44 @@ class ProcessTable:
                 "service_time_cumulative": entry.get("service_time_cumulative", 0.0),
                 "service_time_max": entry.get("service_time_max", 0.0),
                 "waiting_time_cumulative": entry.get("waiting_time_cumulative", 0.0),
+                "call_count": entry.get("call_count", 0.0),
+                "max_parallelism": entry.get("max_parallelism", 0),
+                "kv_token_time_cumulative": entry.get("kv_token_time_cumulative", 0.0),
+                "longest_critical_path": entry.get("longest_critical_path", 0.0),
+                "longest_kv_critical_path": entry.get("longest_kv_critical_path", 0.0),
                 "preferred_engines": entry.get("preferred_engines", []),
                 "engine_ids": engine_ids_copy,
+                "engine_request_counts": dict(entry.get("engine_request_counts", {})),
                 "threads": threads_copy,
+                "most_recent_call_arrival": entry.get("most_recent_call_arrival"),
+                "most_recent_call_completion": entry.get("most_recent_call_completion"),
+            }
+
+        return snapshot
+    
+    def sum_processes(self):
+        # Take a quick snapshot of keys and shallow copies of entries while holding the lock,
+        # then build JSON-serializable copies outside the lock to avoid blocking other threads.
+        with self.lock:
+            items = list(self.table.items())
+
+        snapshot = {}
+        for pid, entry in items:
+            # create shallow serializable copies
+            engine_ids_copy = list(entry.get("engine_ids", []))
+
+            snapshot[pid] = {
+                "service_time_cumulative": entry.get("service_time_cumulative", 0.0),
+                "service_time_max": entry.get("service_time_max", 0.0),
+                "waiting_time_cumulative": entry.get("waiting_time_cumulative", 0.0),
+                "call_count": entry.get("call_count", 0.0),
+                "max_parallelism": entry.get("max_parallelism", 0),
+                "kv_token_time_cumulative": entry.get("kv_token_time_cumulative", 0.0),
+                "longest_critical_path": entry.get("longest_critical_path", 0.0),
+                "longest_kv_critical_path": entry.get("longest_kv_critical_path", 0.0),
+                "preferred_engines": entry.get("preferred_engines", []),
+                "engine_ids": engine_ids_copy,
+                "engine_request_counts": dict(entry.get("engine_request_counts", {})),
                 "most_recent_call_arrival": entry.get("most_recent_call_arrival"),
                 "most_recent_call_completion": entry.get("most_recent_call_completion"),
             }

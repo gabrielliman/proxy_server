@@ -204,7 +204,6 @@ class AutelixStrategy(LoadBalancerStrategy):
                 return preferred[0]
 
         engine = self._select_least_used(metrics)
-        print("LB SELECT_ENGINE CALLED", program_id, num_input_tokens)
 
         return engine
 
@@ -308,17 +307,39 @@ class ThresholdAutellixStrategy(LoadBalancerStrategy):
 class BaseDynamicAutellixStrategy(LoadBalancerStrategy):
     """Classe base contendo a lógica compartilhada para Autellix Dinâmico."""
     
-    def __init__(self, short_request_threshold: int = 2048):
+    def __init__(
+        self, 
+        short_request_threshold: int = 2048,
+        threshold_metric: str = "total",
+        threshold_value: float = 10.0
+    ):
         self.short_request_threshold = short_request_threshold
+        self.threshold_metric = threshold_metric
+        self.threshold_value = threshold_value
         self.lock = Lock()
 
     def _is_engine_full(self, engine: str, metrics: Dict[str, Dict]) -> bool:
-        """Verifica se a engine atingiu seu limite de BACKEND_PARALLELISM."""
+        """Verifica se a engine atingiu seu limite baseado na métrica configurada."""
         m = metrics.get(engine, {})
-        # Usamos local_active_requests (running + waiting) como proxy de ocupação
-        load = int(m.get("local_active_requests", 0))
-        capacity = BACKEND_PARALLELISM.get(engine) # 10 é fallback de segurança
-        return load >= capacity
+        
+        # Special aggregation case for "total"
+        if self.threshold_metric == "total":
+            running = int(m.get("running", 0))
+            waiting = int(m.get("waiting", 0))
+            metric_val = float(running + waiting)
+        else:
+            val = m.get(self.threshold_metric)
+            try:
+                metric_val = float(val) if val is not None else None
+            except Exception:
+                metric_val = None
+
+        # If we can't parse the metric, default to not full.
+        # Otherwise, check if the metric meets or exceeds the threshold.
+        if metric_val is None:
+            return False
+            
+        return metric_val >= self.threshold_value
 
     def _select_least_used_global(self, metrics: Dict[str, Dict]) -> str:
         """Seleciona a engine mais ociosa do cluster inteiro."""
@@ -329,7 +350,18 @@ class BaseDynamicAutellixStrategy(LoadBalancerStrategy):
         candidates = []
 
         for engine, m in metrics.items():
-            load = int(m.get("local_active_requests", 0))
+            # Aligning the "least used" check with the new metric logic as well
+            if self.threshold_metric == "total":
+                running = int(m.get("running", 0))
+                waiting = int(m.get("waiting", 0))
+                load = float(running + waiting)
+            else:
+                val = m.get(self.threshold_metric)
+                try:
+                    load = float(val) if val is not None else float("inf")
+                except Exception:
+                    load = float("inf")
+
             if load < min_load:
                 min_load = load
                 candidates = [engine]
@@ -338,13 +370,47 @@ class BaseDynamicAutellixStrategy(LoadBalancerStrategy):
 
         return random.choice(candidates) if candidates else random.choice(ALL_BACKENDS)
     
+    def _select_least_used_subset(self, subset: List[str], metrics: Dict[str, Dict]) -> str:
+        """Encontra a engine mais ociosa apenas dentro de uma lista específica."""
+        if not subset:
+            # Assumindo que ALL_BACKENDS está disponível no escopo global
+            return random.choice(ALL_BACKENDS)
+            
+        min_load = float("inf")
+        candidates = []
+        
+        for engine in subset:
+            m = metrics.get(engine, {})
+            
+            # Aplica a lógica dinâmica de métricas
+            if getattr(self, 'threshold_metric', 'total') == "total":
+                running = int(m.get("running", 0))
+                waiting = int(m.get("waiting", 0))
+                load = float(running + waiting)
+            else:
+                val = m.get(self.threshold_metric)
+                try:
+                    load = float(val) if val is not None else float("inf")
+                except Exception:
+                    load = float("inf")
+
+            # Coleta candidatos com a menor carga
+            if load < min_load:
+                min_load = load
+                candidates = [engine]
+            elif load == min_load:
+                candidates.append(engine)
+                
+        return random.choice(candidates) if candidates else random.choice(ALL_BACKENDS)
+
+
     def reorder_preferred_engines(self, program_id: str, metrics: Dict[str, Dict]):
         """
         Reordena as engines favoritas com base na Proporção de Dominância:
         (Requisições deste programa / Total de requisições na engine).
         """
+        return
         from routing.process_table import PROCESS_TABLE
-        
         with PROCESS_TABLE.lock:
             entry = PROCESS_TABLE.table.get(program_id)
             if not entry or not entry.get("preferred_engines"):
@@ -396,8 +462,6 @@ class OrderedDynamicAutellixStrategy(BaseDynamicAutellixStrategy):
                 for idx, engine in enumerate(preferred):
                     if not self._is_engine_full(engine, metrics):
                         selected_engine = engine
-                        if idx > 0:
-                            spillover_occurred = True
                         break
                     else:
                         spillover_occurred = True
@@ -407,6 +471,7 @@ class OrderedDynamicAutellixStrategy(BaseDynamicAutellixStrategy):
                         self.reorder_preferred_engines(program_id, metrics)
                     return selected_engine
                 
+
                 new_engine = self._select_least_used_global(metrics)
                 PROCESS_TABLE.add_preferred_engine(program_id, new_engine)
                 return new_engine
@@ -422,34 +487,33 @@ class LeastLoadDynamicAutellixStrategy(BaseDynamicAutellixStrategy):
     async def select_engine(
         self, program_id: Optional[str], num_input_tokens: int, metrics: Dict[str, Dict]
     ) -> str:
+        
         if num_input_tokens <= self.short_request_threshold:
             return self._select_least_used_global(metrics)
 
         if program_id:
+            from routing.process_table import PROCESS_TABLE
             proc = PROCESS_TABLE.get_process(program_id)
             preferred = proc.get("preferred_engines", []) if proc else []
 
             if preferred:
-                best_engine = None
-                best_load = float("inf")
-                all_full = True
+                # 1. Filtra apenas as engines favoritas que NÃO atingiram o limite de capacidade
+                available_preferred = [
+                    engine for engine in preferred 
+                    if not self._is_engine_full(engine, metrics)
+                ]
 
-                for engine in preferred:
-                    if not self._is_engine_full(engine, metrics):
-                        all_full = False
-                        load = int(metrics.get(engine, {}).get("local_active_requests", 0))
-                        if load < best_load:
-                            best_load = load
-                            best_engine = engine
+                # 2. Se houver engines disponíveis, usa o método que já consertamos para pegar a mais ociosa
+                if available_preferred:
+                    return self._select_least_used_subset(available_preferred, metrics)
 
-                if not all_full and best_engine:
-                    return best_engine
-
-                # Spillover: Todas as engines favoritas estão cheias
+                # 3. Spillover: Todas as engines favoritas estão cheias
+                # (Aloca uma nova engine no cluster global)
                 new_engine = self._select_least_used_global(metrics)
                 PROCESS_TABLE.add_preferred_engine(program_id, new_engine)
                 return new_engine
 
+        # Fallback caso não tenha program_id
         return self._select_least_used_global(metrics)
 
 
@@ -463,28 +527,12 @@ class ProbabilisticCascadeAutellixStrategy(BaseDynamicAutellixStrategy):
     def __init__(
         self, 
         short_request_threshold: int = 2048, 
-        l_min_ratio: float = 0.50,  # 70% da capacidade = começa a vazar
+        l_min_ratio: float = 0.50,  # 50% da capacidade = começa a vazar
         l_max_ratio: float = 0.95   # 95% da capacidade = vaza 100% das requisições
     ):
         super().__init__(short_request_threshold)
         self.l_min_ratio = l_min_ratio
         self.l_max_ratio = l_max_ratio
-
-    def _select_least_used_subset(self, subset: List[str], metrics: Dict[str, Dict]) -> str:
-        """Encontra a engine mais ociosa apenas dentro de uma lista específica."""
-        if not subset:
-            return random.choice(ALL_BACKENDS)
-            
-        best_engine = subset[0]
-        min_load = float("inf")
-        
-        for engine in subset:
-            load = int(metrics.get(engine, {}).get("local_active_requests", 0))
-            if load < min_load:
-                min_load = load
-                best_engine = engine
-                
-        return best_engine
 
     async def select_engine(
         self, program_id: Optional[str], num_input_tokens: int, metrics: Dict[str, Dict]
@@ -506,7 +554,19 @@ class ProbabilisticCascadeAutellixStrategy(BaseDynamicAutellixStrategy):
 
                 for engine in preferred:
                     capacity = BACKEND_PARALLELISM.get(engine, 10)
-                    load = int(metrics.get(engine, {}).get("local_active_requests", 0))
+                    
+                    # CORREÇÃO: Usar a mesma lógica dinâmica de métricas da classe base
+                    m = metrics.get(engine, {})
+                    if getattr(self, 'threshold_metric', 'total') == "total":
+                        running = int(m.get("running", 0))
+                        waiting = int(m.get("waiting", 0))
+                        load = float(running + waiting)
+                    else:
+                        val = m.get(self.threshold_metric)
+                        try:
+                            load = float(val) if val is not None else 0.0
+                        except Exception:
+                            load = 0.0
                     
                     l_min = capacity * self.l_min_ratio
                     l_max = capacity * self.l_max_ratio
@@ -519,7 +579,7 @@ class ProbabilisticCascadeAutellixStrategy(BaseDynamicAutellixStrategy):
                     # 2. Carga crítica: Spillover garantido
                     if load >= l_max:
                         spillover_occurred = True
-                        continue
+                        continue  # CORREÇÃO: Pula imediatamente para a próxima engine da lista
                         
                     # 3. Zona de transição: Probabilidade de spillover
                     p_spillover = (load - l_min) / (l_max - l_min)
@@ -528,20 +588,21 @@ class ProbabilisticCascadeAutellixStrategy(BaseDynamicAutellixStrategy):
                         break
                     else:
                         spillover_occurred = True
-                        continue
 
                 if selected_engine:
                     if spillover_occurred:
+                        # Assumindo que o método reorder_preferred_engines existe
                         self.reorder_preferred_engines(program_id, metrics)
                     return selected_engine
 
                 # --- TRATAMENTO DE EXAUSTÃO ---
                 
-                # Se o loop terminou, todas as favoritas vazaram a requisição.
+                # Se o loop terminou sem 'selected_engine', todas as favoritas deram spillover.
                 # Precisamos de uma engine nova. Quais ainda não foram usadas por este programa?
                 available_new_engines = [e for e in ALL_BACKENDS if e not in preferred]
 
                 if not available_new_engines:
+                    # Esgotou o cluster inteiro
                     selected_engine = self._select_least_used_subset(preferred, metrics)
                     self.reorder_preferred_engines(program_id, metrics)
                     return selected_engine

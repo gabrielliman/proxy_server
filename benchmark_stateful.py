@@ -794,7 +794,7 @@ def get_baseline_metrics(output_json_path):
     sched_suffix = None
     
     # Lista de prefixos conhecidos baseada no seu script Bash
-    known_suffixes = ["fcfs", "plas_service_ewma", "plas_kv_token_time"]
+    known_suffixes = ["fcfs", "plas_service_cumulative", "plas_kv_token_time", "atlas_service_cumulative", "atlas_kv_token_time"]
     
     for suffix in known_suffixes:
         if filename.startswith(f"output_{suffix}_"):

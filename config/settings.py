@@ -23,8 +23,8 @@ MODEL_ROUTES = json.loads(_env_model_routes) if _env_model_routes else _default_
 # 3. Dictionary fallback for BACKEND_PARALLELISM
 # nao funciona para o endpoint completions
 _default_backend_parallelism = {
-    "http://localhost:8105": 10,
-    "http://localhost:8106": 10,
+    "http://localhost:8105": 15,
+    "http://localhost:8106": 15,
 }
 _env_backend_parallelism = os.getenv("BACKEND_PARALLELISM")
 BACKEND_PARALLELISM = json.loads(_env_backend_parallelism) if _env_backend_parallelism else _default_backend_parallelism
@@ -51,7 +51,7 @@ PROCESS_TABLE_PRUNE_TTL = 600  # default 10 minutes
 PROCESS_TABLE_PRUNE_INTERVAL = 60  # run pruner every 60 seconds
 
 # Scheduler selection: 'fcfs' (default), 'plas', "atlas"
-SCHEDULER = os.getenv("SCHEDULER", "plas")
+SCHEDULER = os.getenv("SCHEDULER", "atlas")
 
 # PLAS metric type: 'service_cumulative' (default, LAS) or 'kv_token_time'
 # - service_cumulative: Uses sum of actual service time (Least Attained Service)
@@ -63,7 +63,7 @@ DISCRETIZED_PRIORITY_BUCKETS = 10  # K: number of priority levels
 DISCRETIZED_PRIORITY_BASE = 50.0   # Adjust this span based on your expected max cumulative metric
 ANTI_STARVATION_RATIO_THRESHOLD = 0.5  # beta: W_total/T_total >= threshold triggers promotion to Q1
 
-LOAD_BALANCER_SHORT_REQUEST_THRESHOLD = int(os.getenv("LOAD_BALANCER_SHORT_REQUEST_THRESHOLD", 2048))
+LOAD_BALANCER_SHORT_REQUEST_THRESHOLD = int(os.getenv("LOAD_BALANCER_SHORT_REQUEST_THRESHOLD", 1))
 
 # Load balancer configuration
 LOAD_BALANCER_ENABLE = True
@@ -71,11 +71,11 @@ LOAD_BALANCER_METRICS_LOG_INTERVAL = 5  # seconds between human-readable logs
 LOAD_BALANCER_ENABLE_METRICS_QUERY = True  # query engine /metrics endpoints
 
 # Options: "round-robin", "least-total-load", "least-waiting", "least-running", "least-kv-cache", "autellix", "threshold-autellix"
-LOAD_BALANCER_STRATEGY = os.getenv("LOAD_BALANCER_STRATEGY", "autellix")
+LOAD_BALANCER_STRATEGY = os.getenv("LOAD_BALANCER_STRATEGY", "ordered-dynamic-autellix")
 
 # Threshold Autellix Configuration
-LOAD_BALANCER_THRESHOLD_METRIC = os.getenv("LOAD_BALANCER_THRESHOLD_METRIC", "kv_cache_percent")  # e.g., "kv_cache_percent", "waiting", "total", "running"
-LOAD_BALANCER_THRESHOLD_VALUE = float(os.getenv("LOAD_BALANCER_THRESHOLD_VALUE", 90.0))           # e.g., 90.0, 10.0, etc.
+LOAD_BALANCER_THRESHOLD_METRIC = os.getenv("LOAD_BALANCER_THRESHOLD_METRIC", "running")  # e.g., "kv_cache_percent", "waiting", "total", "running"
+LOAD_BALANCER_THRESHOLD_VALUE = float(os.getenv("LOAD_BALANCER_THRESHOLD_VALUE", 10.0))           # e.g., 90.0, 10.0, etc.
 
 # Options: "round-robin", "least-total-load", "least-waiting", "least-running", "least-kv-cache"
 LOAD_BALANCER_FALLBACK_STRATEGY = os.getenv("LOAD_BALANCER_FALLBACK_STRATEGY", "least-total-load")

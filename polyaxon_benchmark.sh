@@ -142,7 +142,7 @@ BURSTINESS=1
 # Format: "scheduler_name:plas_metric_type"
 SCHEDULER_CONFIGS=(
   "fcfs:N/A"
-#   "plas:service_ewma"
+#   "plas:service_cumulative"
 #   "plas:kv_token_time"
 ) 
 
@@ -211,9 +211,9 @@ for sched_conf in "${SCHEDULER_CONFIGS[@]}"; do
 
     # Create a clear string for the JSON filename
     sched_suffix=$scheduler
-    if [ "$scheduler" == "plas" ]; then
-        sched_suffix="${scheduler}_${plas_metric}"
-    fi
+    if [ "$scheduler" = "plas" ] || [ "$scheduler" = "atlas" ]; then
+    sched_suffix="${scheduler}_${plas_metric}"
+    fi  
 
     for rate in "${RATES[@]}"; do
 
@@ -327,7 +327,7 @@ for sched_conf in "${SCHEDULER_CONFIGS[@]}"; do
     IFS=':' read -r scheduler plas_metric <<< "$sched_conf"
 
     sched_suffix=$scheduler
-    if [ "$scheduler" == "plas" ]; then
+    if [ "$scheduler" = "plas" ] || [ "$scheduler" = "atlas" ]; then
         sched_suffix="${scheduler}_${plas_metric}"
     fi
 

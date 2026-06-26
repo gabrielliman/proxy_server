@@ -79,7 +79,7 @@ def tokens_in_text(text):
 API_BASE = os.getenv("CUSTOM_API_BASE", "http://localhost:8000")
 DEFAULT_MODEL = os.getenv("CUSTOM_MODEL", "seu-modelo-aqui")
 
-def gpt(prompt, model=None, temperature=1.0, max_tokens=1000, n=1, stop=None, program_id="default_prog") -> list:
+def gpt(prompt, model=None, temperature=1.0, max_tokens=2048, n=1, stop=None, program_id="default_prog") -> list:
     """
     Wrapper para prompts em texto simples. Adicionado o parâmetro program_id.
     """
@@ -157,7 +157,7 @@ def _single_request(url, payload, program_id):
             PROGRAM_METRICS_REGISTRY[program_id].append(rm)
         return "", {}
 
-def chatgpt(messages, model=None, temperature=1.0, max_tokens=1000, n=1, stop=None, program_id="default_prog") -> list:
+def chatgpt(messages, model=None, temperature=1.0, max_tokens=2048, n=1, stop=None, program_id="default_prog") -> list:
     """
     Faz 'n' requisições HTTP síncronas em paralelo para a API customizada usando Threads.
     """

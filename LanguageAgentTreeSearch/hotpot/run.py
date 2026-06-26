@@ -55,6 +55,8 @@ def summarize_program(prog: ProgramMetrics) -> Dict[str, Any]:
 
     return {
         "program_id": prog.program_id,
+        "start_time": start,
+        "end_time": end,
         "total_e2el_s": full_time,
         "num_requests": len(prog.requests),
         "total_input_tokens": total_input_tokens,
@@ -141,7 +143,7 @@ def get_baseline_metrics(output_json_path):
         
     filename = os.path.basename(output_json_path)
     sched_suffix = None
-    known_suffixes = ["fcfs", "plas_service_ewma", "plas_kv_token_time"]
+    known_suffixes = ["fcfs", "plas_service_cumulative", "plas_kv_token_time", "atlas_service_cumulative", "atlas_kv_token_time"]
     
     for suffix in known_suffixes:
         if filename.startswith(f"output_{suffix}_"):
@@ -404,10 +406,11 @@ async def run_async_orchestrator(args):
     )
 
     # Aggregação E2EL por programa
-    e2el_values = np.array([p["total_e2el_ms"] for p in per_program_metrics if p.get("total_e2el_ms") is not None], dtype=float)
+    e2el_values = np.array([p["total_e2el_s"] for p in per_program_metrics if p.get("total_e2el_s") is not None], dtype=float)
     if e2el_values.size:
         full_metrics["mean_e2el_per_program"] = float(np.mean(e2el_values))
         full_metrics["median_e2el_per_program"] = float(np.median(e2el_values))
+        full_metrics["p95_e2el_per_program"] = float(np.percentile(e2el_values, 95))
         full_metrics["p99_e2el_per_program"] = float(np.percentile(e2el_values, 99))
 
 
