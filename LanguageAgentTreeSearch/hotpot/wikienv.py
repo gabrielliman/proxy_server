@@ -1,7 +1,7 @@
 import ast
 import json
 import time
-import gym
+import gymnasium as gym
 import requests
 from bs4 import BeautifulSoup
 

@@ -1,6 +1,6 @@
 import json
 import os
-import gym
+import gymnasium as gym
 import numpy as np
 import re
 import string
@@ -100,8 +100,8 @@ class HotPotQAWrapper(gym.Wrapper):
 
   def _get_info(self):
     return {
-      "steps": self.steps, 
-      "answer": self.answer,
+      "steps": self.env.steps, 
+      "answer": self.env.answer,
       "question": self.data[self.data_idx][0], 
       "hotpot_split": self.split
     }
@@ -169,8 +169,8 @@ class FeverWrapper(gym.Wrapper):
 
   def _get_info(self):
     return {
-      "steps": self.steps, 
-      "answer": self.answer,
+      "steps": self.env.steps, 
+      "answer": self.env.answer,
       "question": self.data[self.data_idx][0], 
       "fever_split": self.split
     }

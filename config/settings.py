@@ -63,7 +63,7 @@ DISCRETIZED_PRIORITY_BUCKETS = 10  # K: number of priority levels
 DISCRETIZED_PRIORITY_BASE = 50.0   # Adjust this span based on your expected max cumulative metric
 ANTI_STARVATION_RATIO_THRESHOLD = 0.5  # beta: W_total/T_total >= threshold triggers promotion to Q1
 
-LOAD_BALANCER_SHORT_REQUEST_THRESHOLD = int(os.getenv("LOAD_BALANCER_SHORT_REQUEST_THRESHOLD", 1))
+LOAD_BALANCER_SHORT_REQUEST_THRESHOLD = int(os.getenv("LOAD_BALANCER_SHORT_REQUEST_THRESHOLD", 100))
 
 # Load balancer configuration
 LOAD_BALANCER_ENABLE = True

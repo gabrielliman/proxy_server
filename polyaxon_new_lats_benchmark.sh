@@ -1,4 +1,67 @@
 #!/bin/bash
+
+#Model Parameters
+MODEL_NAME="meta-llama/Llama-3.1-8B-Instruct"
+MODEL_PATH="/scratch/hpc4ai/models/llama/Llama-3.1-8B-Instruct"
+MAX_NUM_SEQS=100
+LOG_DIR="./var/logs"
+
+# Number of instances parameters
+NUM_INSTANCES=16       # Change this to the number of ports you want
+START_PORT=8105        # The starting port number
+PARALLELISM_VALUE=150   # The parallelism value for all ports
+GPU=0 #starting gpu
+ENGINE_IDX=1  # Counter to create PID1, PID2, etc.
+PER_GPU=4
+GPU_PERCENT=0.20
+# Lats parameters
+BASE_URL="http://localhost:8081" #proxy server url
+ALGORITHM="lats"
+START_INDEX=900
+END_INDEX=950
+ITERATIONS=10
+N_GENERATE=100 #5
+N_EVALUATE=1
+
+# Benchmark parameters
+OUTPUTS_DIR="outputs_lats/atlas_service_50prog_10it_100gen_rate8_bur01_100thres_2048out_150parall"
+REPEATS=10
+RATES=("8")
+# RATES=("0.5" "1" "2" "4" "8")
+BURSTINESS=0.1
+BASELINE_SCHEDULER=autellix
+EXPERIMENT_CONFIGS=(
+    #baseline fcfs
+    # "fcfs:N/A:least-total-load:N/A:0"
+    #baseline autellix
+    # "atlas:service_cumulative:autellix:N/A:0"
+    "atlas:service_cumulative:threshold-autellix:total:15"
+    "atlas:service_cumulative:ordered-dynamic-autellix:N/A:0"
+    "atlas:service_cumulative:least-load-dynamic-autellix:N/A:0"
+    "atlas:service_cumulative:probabilistic-cascade-autellix:N/A:0"
+    "atlas:service_cumulative:ordered-dynamic-autellix-reorder:N/A:0"
+    "atlas:service_cumulative:probabilistic-cascade-autellix-reorder:N/A:0"
+
+
+    #nossa proposta escalonador
+    # "atlas:kv_token_time:autellix:N/A:0"
+    #nossa proposta lb
+    # "atlas:service_cumulative:threshold-autellix:running:10"
+    # "atlas:service_cumulative:ordered-dynamic-autellix:N/A:0"
+    # "atlas:service_cumulative:least-load-dynamic-autellix:N/A:0"
+    #nossa proposta combinada
+    # "atlas:kv_token_time:ordered-dynamic-autellix:N/A:0"
+)
+
+SCHEDULER_CONFIGS=(
+    # "fcfs:N/A"
+    # "plas:service_cumulative"
+    # "plas:kv_token_time"
+    "atlas:service_cumulative"
+    # "atlas:kv_token_time"
+
+)
+
 source /opt/conda/etc/profile.d/conda.sh && conda activate proxy_server
 set -x
 # ## arruma um dos warning, mas nao entendi direito
@@ -19,31 +82,8 @@ done
 
 rm ./kv_cache_usage.csv 2>/dev/null || true
 
-# Set the model name once
-MODEL_NAME="meta-llama/Llama-3.1-8B-Instruct"
-MODEL_PATH="/scratch/hpc4ai/models/llama/Llama-3.1-8B-Instruct"
 # Define the ports as an array. Add or remove ports here to automatically scale.
 export MODEL="$MODEL_NAME"
-
-# Shared parameters
-MAX_NUM_SEQS=10
-LOG_DIR="./var/logs"
-
-# PORTS=(8105 8106)
-# export MODEL_ROUTES="{
-#   \"$MODEL_NAME\": [
-#     \"http://localhost:8105\", 
-#     \"http://localhost:8106\"
-#   ]
-# }"
-# export BACKEND_PARALLELISM='{
-#   "http://localhost:8105": 10, 
-#   "http://localhost:8106": 10
-# }'
-# Configuration variables
-NUM_INSTANCES=16       # Change this to the number of ports you want
-START_PORT=8105        # The starting port number
-PARALLELISM_VALUE=15   # The parallelism value for all ports
 
 # Initialize empty arrays
 PORTS=()
@@ -106,9 +146,6 @@ trap cleanup_engines EXIT INT TERM
 
 
 # Loop through the PORTS array and start a server for each
-GPU=0
-ENGINE_IDX=1  # Counter to create PID1, PID2, etc.
-
 for PORT in "${PORTS[@]}"; do
     echo "[INFO] Booting server on port $PORT..."
     
@@ -119,7 +156,7 @@ for PORT in "${PORTS[@]}"; do
         --max-num-seqs "$MAX_NUM_SEQS" \
         --dtype bfloat16 \
         --max-model-len 40000 \
-        --gpu-memory-utilization 0.20 \
+        --gpu-memory-utilization $GPU_PERCENT \
         --served-model-name $MODEL_NAME \
         > >(tee "$LOG_DIR/saida_VLLM_${PORT}.txt") 2>&1 &
         
@@ -130,7 +167,7 @@ for PORT in "${PORTS[@]}"; do
     eval "echo '[INFO] Engine $PORT assigned to PID${ENGINE_IDX}=\$PID${ENGINE_IDX}'"
         
     wait_for_ready "$PORT"
-    if (( ENGINE_IDX % 4 == 0 )); then
+    if (( ENGINE_IDX % $PER_GPU == 0 )); then
         GPU=$((GPU + 1))
     fi
     ENGINE_IDX=$((ENGINE_IDX + 1))
@@ -138,7 +175,6 @@ done
 # ============================================================
 # Benchmark Setup
 # ============================================================
-BASE_URL="http://localhost:8081"
 export CUSTOM_API_BASE="$BASE_URL"
 export CUSTOM_MODEL="$MODEL_NAME"
 # ============================================================
@@ -155,51 +191,7 @@ done
 # ============================================================
 # Experiment grid
 # ============================================================
-MODEL="$MODEL_NAME"
-ALGORITHM="lats"
-START_INDEX=900
-END_INDEX=910
-ITERATIONS=50
-N_GENERATE=5
-N_EVALUATE=1
-OUTPUTS_DIR="outputs_lats/atlas_service_10prog_50it_5gen_rate8_bur01_1threshold"
 mkdir -p "$OUTPUTS_DIR"
-
-REPEATS=10
-RATES=("8")
-# RATES=("0.5" "1" "2" "4" "8")
-BURSTINESS=0.1
-
-
-EXPERIMENT_CONFIGS=(
-    #baseline fcfs
-    # "fcfs:N/A:least-total-load:N/A:0"
-    #baseline autellix
-    # "atlas:service_cumulative:autellix:N/A:0"
-    "atlas:service_cumulative:threshold-autellix:running:10"
-    "atlas:service_cumulative:ordered-dynamic-autellix:N/A:0"
-    "atlas:service_cumulative:least-load-dynamic-autellix:N/A:0"
-    "atlas:service_cumulative:probabilistic-cascade-autellix:N/A:0"
-
-    #nossa proposta escalonador
-    # "atlas:kv_token_time:autellix:N/A:0"
-    #nossa proposta lb
-    # "atlas:service_cumulative:threshold-autellix:running:10"
-    # "atlas:service_cumulative:ordered-dynamic-autellix:N/A:0"
-    # "atlas:service_cumulative:least-load-dynamic-autellix:N/A:0"
-    #nossa proposta combinada
-    # "atlas:kv_token_time:ordered-dynamic-autellix:N/A:0"
-)
-
-SCHEDULER_CONFIGS=(
-    # "fcfs:N/A"
-    # "plas:service_cumulative"
-    # "plas:kv_token_time"
-    "atlas:service_cumulative"
-    # "atlas:kv_token_time"
-
-) 
-
 
 # ============================================================
 # Helper: scrape per-engine metrics
@@ -258,11 +250,12 @@ for sched_conf in "${SCHEDULER_CONFIGS[@]}"; do
         # ------------------------------------
         for RUN in $(seq 1 $REPEATS); do
             echo "Run $RUN / $REPEATS [Baseline]"
+            PROXY_ERROR="${OUTPUTS_DIR}/ERROR_proxy_output_${sched_suffix}_autellix_rate${rate}_run${RUN}.txt"
 
             SCHEDULER="$scheduler" \
             PLAS_METRIC_TYPE="$plas_metric" \
             LOAD_BALANCER_STRATEGY="autellix" \
-            python main.py &
+            python main.py 2> "$PROXY_ERROR" &
             PROXY_PID=$!
             sleep 10  # tempo para proxy + engines estabilizarem
 
@@ -283,6 +276,7 @@ for sched_conf in "${SCHEDULER_CONFIGS[@]}"; do
                 done < <(get_prefix_metrics_per_engine "$url" "$PORT")
             done
             OUTPUT_JSON="${OUTPUTS_DIR}/baseline_output_${sched_suffix}_autellix_rate${rate}_run${RUN}.json"
+            OUTPUT_ERROR="${OUTPUTS_DIR}/ERROR_baseline_output_${sched_suffix}_autellix_rate${rate}_run${RUN}.txt"
             OUTPUT_KV_CACHE="${OUTPUTS_DIR}/baseline_output_${sched_suffix}_autellix_rate${rate}_run${RUN}_kv_cache.csv"
 
             python LanguageAgentTreeSearch/hotpot/run.py \
@@ -295,7 +289,7 @@ for sched_conf in "${SCHEDULER_CONFIGS[@]}"; do
                 --output-json $OUTPUT_JSON \
                 --burstiness $BURSTINESS \
                 --program-rate "$rate" \
-                --is_baseline_run 1
+                --is_baseline_run 1 2> "$OUTPUT_ERROR"
             #Matando o proxy
             PROG_FILE="${OUTPUTS_DIR}/baseline_processes_summary_${sched_suffix}_autellix_rate${rate}_run${RUN}.json"
             curl -s "${BASE_URL}/processes_summary" | python3 -m json.tool > "$PROG_FILE"
@@ -407,13 +401,15 @@ for config in "${EXPERIMENT_CONFIGS[@]}"; do
             # ------------------------------------
             # Start proxy server
             # ------------------------------------
+            PROXY_ERROR="${OUTPUTS_DIR}/ERROR_proxy_output_${sched_suffix}_${strat_suffix}_rate${rate}_run${RUN}.txt"
+
             SCHEDULER="$scheduler" \
             PLAS_METRIC_TYPE="$plas_metric" \
             LOAD_BALANCER_STRATEGY="$strategy" \
             LOAD_BALANCER_THRESHOLD_METRIC="$thresh_metric" \
             LOAD_BALANCER_THRESHOLD_VALUE="$thresh_val" \
             LOAD_BALANCER_FALLBACK_STRATEGY="least-total-load" \
-            python main.py &
+            python main.py 2> "$PROXY_ERROR" &
 
             PROXY_PID=$!
             sleep 10  # tempo para proxy + engines estabilizarem
@@ -440,6 +436,7 @@ for config in "${EXPERIMENT_CONFIGS[@]}"; do
                         before_h[$engine]=$h
                     done < <(get_prefix_metrics_per_engine "$url" "$PORT")
                 done
+                OUTPUT_ERROR="${OUTPUTS_DIR}/ERROR_output_${sched_suffix}_${strat_suffix}_rate${rate}_run${RUN}.txt"
                 OUTPUT_JSON="${OUTPUTS_DIR}/output_${sched_suffix}_${strat_suffix}_rate${rate}_run${RUN}.json"
                 OUTPUT_KV_CACHE="${OUTPUTS_DIR}/output_${sched_suffix}_${strat_suffix}_rate${rate}_run${RUN}_kv_cache.csv"
                 python LanguageAgentTreeSearch/hotpot/run.py \
@@ -452,7 +449,7 @@ for config in "${EXPERIMENT_CONFIGS[@]}"; do
                     --output-json $OUTPUT_JSON \
                     --burstiness $BURSTINESS \
                     --program-rate "$rate" \
-                    --is_baseline_run 0
+                    --is_baseline_run 0 2> "$OUTPUT_ERROR"
                 # ------------------------------------
                 # AFTER metrics + compute delta
                 # ------------------------------------

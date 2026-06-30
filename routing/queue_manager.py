@@ -65,7 +65,7 @@ class DiscretizedQueueWrapper:
 
 
 def init_queues():
-    """Inicializa filas para todos os backends.
+    """Inicializa a fila global do cluster.
     Chamada automática na primeira importação do dispatcher.
     """
     global backend_queues
@@ -73,14 +73,16 @@ def init_queues():
     if backend_queues:
         return
 
+    # Usamos uma chave única para a fila global
+    global_queue_name = "global_cluster"
+
     if SCHEDULER in ("plas", "atlas"):
         from config.settings import DISCRETIZED_PRIORITY_BUCKETS
         backend_queues = {
-            backend: DiscretizedQueueWrapper(DISCRETIZED_PRIORITY_BUCKETS)
-            for backend in ALL_BACKENDS
+            global_queue_name: DiscretizedQueueWrapper(DISCRETIZED_PRIORITY_BUCKETS)
         }
     else:
-        backend_queues = {backend: asyncio.Queue() for backend in ALL_BACKENDS}
+        backend_queues = {global_queue_name: asyncio.Queue()}
 
 
 def get_queue(backend: str):

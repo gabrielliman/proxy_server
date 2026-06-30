@@ -76,17 +76,6 @@ async def chat_completion(program_id: str, request: Request):
     input_text = "\n".join(m.get("content", "") for m in messages if isinstance(m, dict))
     num_input_tokens = count_tokens(input_text)
 
-    # -----------------------------
-    # Select engine via Autellix LB
-    # -----------------------------
-    backend = None
-    while backend is None:
-        backend = await LOAD_BALANCER.select_engine(
-            program_id=program_id,
-            num_input_tokens=num_input_tokens,
-        )
-        if backend is None:
-            await asyncio.sleep(0.05)
 
     # -----------------------------
     # Instrument arrival (with prefill tokens for KV metric)
@@ -100,9 +89,10 @@ async def chat_completion(program_id: str, request: Request):
     disp = get_dispatcher()
 
     return await disp.dispatch(
-        backend=backend,
+        backend="global_cluster",
         data=data,
         program_id=program_id,
         call_id=call_id,
+        input_tokens=num_input_tokens
     )
 

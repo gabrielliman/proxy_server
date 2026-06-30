@@ -65,17 +65,7 @@ class RoundRobinStrategy(LoadBalancerStrategy):
         return engine
         
 class LeastTotalLoadStrategy(LoadBalancerStrategy):
-    """
-    Select engine with minimum (running + waiting).
-    """
-
-    async def select_engine(
-        self,
-        program_id: Optional[str],
-        num_input_tokens: int,
-        metrics: Dict[str, Dict],
-    ) -> str:
-
+    async def select_engine(self, program_id: Optional[str], num_input_tokens: int, metrics: Dict[str, Dict]) -> str:
         if not metrics:
             return random.choice(ALL_BACKENDS)
 
@@ -83,17 +73,16 @@ class LeastTotalLoadStrategy(LoadBalancerStrategy):
         best_load = float("inf")
 
         for engine, m in metrics.items():
-            running = int(m.get("running", 0))
-            waiting = int(m.get("waiting", 0))
-            total = running + waiting
+            total = int(m.get("pt_running", 0))  # <-- Mudança aqui
 
             if total < best_load:
                 best_load = total
                 best_engine = engine
 
-        return best_engine
+        return best_engine or random.choice(ALL_BACKENDS)
 
 class LeastWaitingStrategy(LoadBalancerStrategy):
+    #pega metricas de jeito ruim e lento
     """
     Select engine with minimum waiting requests.
     """
@@ -121,6 +110,7 @@ class LeastWaitingStrategy(LoadBalancerStrategy):
         return best_engine
 
 class LeastRunningStrategy(LoadBalancerStrategy):
+    #pega metricas de jeito ruim e lento
     """
     Select engine with minimum running requests.
     """
@@ -148,6 +138,8 @@ class LeastRunningStrategy(LoadBalancerStrategy):
         return best_engine
 
 class LeastKVCacheStrategy(LoadBalancerStrategy):
+    #pega metricas de jeito ruim e lento, unico jeito possivel
+    
     """
     Select engine with lowest KV cache usage.
     """
@@ -212,21 +204,21 @@ class AutelixStrategy(LoadBalancerStrategy):
 
 
     def _select_least_used(self, metrics: Dict[str, Dict]) -> str:
-        if not metrics:
-            return random.choice(ALL_BACKENDS)
+            if not metrics:
+                return random.choice(ALL_BACKENDS)
 
-        min_load = None
-        candidates = []
+            min_load = None
+            candidates = []
 
-        for engine, m in metrics.items():
-            load = int(m.get("local_active_requests", 0))
-            if min_load is None or load < min_load:
-                min_load = load
-                candidates = [engine]
-            elif load == min_load:
-                candidates.append(engine)
+            for engine, m in metrics.items():
+                load = int(m.get("pt_running", 0)) # <-- Mudança aqui
+                if min_load is None or load < min_load:
+                    min_load = load
+                    candidates = [engine]
+                elif load == min_load:
+                    candidates.append(engine)
 
-        return random.choice(candidates)
+            return random.choice(candidates) if candidates else random.choice(ALL_BACKENDS)
 
 
 class ThresholdAutellixStrategy(LoadBalancerStrategy):
@@ -277,9 +269,7 @@ class ThresholdAutellixStrategy(LoadBalancerStrategy):
                 
                 # Special aggregation case for "total"
                 if self.threshold_metric == "total":
-                    running = int(m.get("running", 0))
-                    waiting = int(m.get("waiting", 0))
-                    metric_val = float(running + waiting)
+                    metric_val = float(m.get("pt_running", 0))
                 else:
                     val = m.get(self.threshold_metric)
                     try:
@@ -311,22 +301,16 @@ class BaseDynamicAutellixStrategy(LoadBalancerStrategy):
         self, 
         short_request_threshold: int = 2048,
         threshold_metric: str = "total",
-        threshold_value: float = 10.0
     ):
         self.short_request_threshold = short_request_threshold
         self.threshold_metric = threshold_metric
-        self.threshold_value = threshold_value
         self.lock = Lock()
 
     def _is_engine_full(self, engine: str, metrics: Dict[str, Dict]) -> bool:
-        """Verifica se a engine atingiu seu limite baseado na métrica configurada."""
+        capacity = BACKEND_PARALLELISM.get(engine, 10)
         m = metrics.get(engine, {})
-        
-        # Special aggregation case for "total"
         if self.threshold_metric == "total":
-            running = int(m.get("running", 0))
-            waiting = int(m.get("waiting", 0))
-            metric_val = float(running + waiting)
+            metric_val = float(m.get("pt_running", 0))
         else:
             val = m.get(self.threshold_metric)
             try:
@@ -339,7 +323,7 @@ class BaseDynamicAutellixStrategy(LoadBalancerStrategy):
         if metric_val is None:
             return False
             
-        return metric_val >= self.threshold_value
+        return metric_val >= capacity
 
     def _select_least_used_global(self, metrics: Dict[str, Dict]) -> str:
         """Seleciona a engine mais ociosa do cluster inteiro."""
@@ -350,11 +334,8 @@ class BaseDynamicAutellixStrategy(LoadBalancerStrategy):
         candidates = []
 
         for engine, m in metrics.items():
-            # Aligning the "least used" check with the new metric logic as well
             if self.threshold_metric == "total":
-                running = int(m.get("running", 0))
-                waiting = int(m.get("waiting", 0))
-                load = float(running + waiting)
+                load = float(m.get("pt_running", 0)) # <-- Mudança aqui
             else:
                 val = m.get(self.threshold_metric)
                 try:
@@ -381,12 +362,8 @@ class BaseDynamicAutellixStrategy(LoadBalancerStrategy):
         
         for engine in subset:
             m = metrics.get(engine, {})
-            
-            # Aplica a lógica dinâmica de métricas
             if getattr(self, 'threshold_metric', 'total') == "total":
-                running = int(m.get("running", 0))
-                waiting = int(m.get("waiting", 0))
-                load = float(running + waiting)
+                load = float(m.get("pt_running", 0)) # <-- Mudança aqui
             else:
                 val = m.get(self.threshold_metric)
                 try:
@@ -409,7 +386,6 @@ class BaseDynamicAutellixStrategy(LoadBalancerStrategy):
         Reordena as engines favoritas com base na Proporção de Dominância:
         (Requisições deste programa / Total de requisições na engine).
         """
-        return
         from routing.process_table import PROCESS_TABLE
         with PROCESS_TABLE.lock:
             entry = PROCESS_TABLE.table.get(program_id)
@@ -440,6 +416,40 @@ class BaseDynamicAutellixStrategy(LoadBalancerStrategy):
 
 
 class OrderedDynamicAutellixStrategy(BaseDynamicAutellixStrategy):
+    """
+    Cascata (Ordered): Tenta as engines na ordem em que foram adicionadas.
+    Prioriza maximizar o hit rate do Prefix Cache na engine principal.
+    """
+    async def select_engine(
+        self, program_id: Optional[str], num_input_tokens: int, metrics: Dict[str, Dict]
+    ) -> str:
+        if num_input_tokens <= self.short_request_threshold:
+            return self._select_least_used_global(metrics)
+
+        if program_id:
+            from routing.process_table import PROCESS_TABLE
+            proc = PROCESS_TABLE.get_process(program_id)
+            preferred = proc.get("preferred_engines", []) if proc else []
+
+            if preferred:
+                selected_engine = None
+
+                for idx, engine in enumerate(preferred):
+                    if not self._is_engine_full(engine, metrics):
+                        selected_engine = engine
+                        break
+
+                if selected_engine:
+                    return selected_engine
+                
+
+                new_engine = self._select_least_used_global(metrics)
+                PROCESS_TABLE.add_preferred_engine(program_id, new_engine)
+                return new_engine
+
+        return self._select_least_used_global(metrics)
+    
+class OrderedReorderDynamicAutellixStrategy(BaseDynamicAutellixStrategy):
     """
     Cascata (Ordered): Tenta as engines na ordem em que foram adicionadas.
     Prioriza maximizar o hit rate do Prefix Cache na engine principal.
@@ -517,7 +527,7 @@ class LeastLoadDynamicAutellixStrategy(BaseDynamicAutellixStrategy):
         return self._select_least_used_global(metrics)
 
 
-class ProbabilisticCascadeAutellixStrategy(BaseDynamicAutellixStrategy):
+class ProbabilisticReorderCascadeAutellixStrategy(BaseDynamicAutellixStrategy):
     """
     Cascata Probabilística (Stateless) com Proteção de Exaustão.
     Avalia as engines favoritas em ordem. Faz spillover estocástico 
@@ -558,9 +568,7 @@ class ProbabilisticCascadeAutellixStrategy(BaseDynamicAutellixStrategy):
                     # CORREÇÃO: Usar a mesma lógica dinâmica de métricas da classe base
                     m = metrics.get(engine, {})
                     if getattr(self, 'threshold_metric', 'total') == "total":
-                        running = int(m.get("running", 0))
-                        waiting = int(m.get("waiting", 0))
-                        load = float(running + waiting)
+                        load = float(m.get("pt_running", 0)) # <-- Mudança aqui
                     else:
                         val = m.get(self.threshold_metric)
                         try:
@@ -615,6 +623,93 @@ class ProbabilisticCascadeAutellixStrategy(BaseDynamicAutellixStrategy):
         # Fallback de segurança global
         return self._select_least_used_global(metrics)
 
+class ProbabilisticCascadeAutellixStrategy(BaseDynamicAutellixStrategy):
+    """
+    Cascata Probabilística (Stateless) com Proteção de Exaustão.
+    Avalia as engines favoritas em ordem. Faz spillover estocástico 
+    se a carga estiver alta. Se esgotar as favoritas, aloca uma nova.
+    Se o cluster inteiro esgotar, enfileira na engine menos carregada.
+    """
+    def __init__(
+        self, 
+        short_request_threshold: int = 2048, 
+        l_min_ratio: float = 0.50,  # 50% da capacidade = começa a vazar
+        l_max_ratio: float = 0.95   # 95% da capacidade = vaza 100% das requisições
+    ):
+        super().__init__(short_request_threshold)
+        self.l_min_ratio = l_min_ratio
+        self.l_max_ratio = l_max_ratio
+
+    async def select_engine(
+        self, program_id: Optional[str], num_input_tokens: int, metrics: Dict[str, Dict]
+    ) -> str:
+        
+        # SHORT REQUEST → Load balance global
+        if num_input_tokens <= self.short_request_threshold:
+            return self._select_least_used_global(metrics)
+
+        # LONG REQUEST → Cascata Probabilística
+        if program_id:
+            from routing.process_table import PROCESS_TABLE
+            proc = PROCESS_TABLE.get_process(program_id)
+            preferred = proc.get("preferred_engines", []) if proc else []
+
+            if preferred:
+                selected_engine = None
+
+                for engine in preferred:
+                    capacity = BACKEND_PARALLELISM.get(engine, 10)
+                    
+                    # CORREÇÃO: Usar a mesma lógica dinâmica de métricas da classe base
+                    m = metrics.get(engine, {})
+                    if getattr(self, 'threshold_metric', 'total') == "total":
+                        load = float(m.get("pt_running", 0)) # <-- Mudança aqui
+                    else:
+                        val = m.get(self.threshold_metric)
+                        try:
+                            load = float(val) if val is not None else 0.0
+                        except Exception:
+                            load = 0.0
+                    
+                    l_min = capacity * self.l_min_ratio
+                    l_max = capacity * self.l_max_ratio
+
+                    # 1. Carga confortável: Fica nesta engine
+                    if load <= l_min:
+                        selected_engine = engine
+                        break
+                        
+                    # 2. Carga crítica: Spillover garantido
+                    if load >= l_max:
+                        continue  # CORREÇÃO: Pula imediatamente para a próxima engine da lista
+                        
+                    # 3. Zona de transição: Probabilidade de spillover
+                    p_spillover = (load - l_min) / (l_max - l_min)
+                    if random.random() > p_spillover:
+                        selected_engine = engine
+                        break
+
+                if selected_engine:
+                    return selected_engine
+
+                # --- TRATAMENTO DE EXAUSTÃO ---
+                
+                # Se o loop terminou sem 'selected_engine', todas as favoritas deram spillover.
+                # Precisamos de uma engine nova. Quais ainda não foram usadas por este programa?
+                available_new_engines = [e for e in ALL_BACKENDS if e not in preferred]
+
+                if not available_new_engines:
+                    # Esgotou o cluster inteiro
+                    selected_engine = self._select_least_used_subset(preferred, metrics)
+                    return selected_engine
+                
+                # SCALE-OUT: Aloca a engine mais ociosa dentre as que ainda não são favoritas
+                new_engine = self._select_least_used_subset(available_new_engines, metrics)
+                PROCESS_TABLE.add_preferred_engine(program_id, new_engine)
+                return new_engine
+
+        # Fallback de segurança global
+        return self._select_least_used_global(metrics)
 
 
 
@@ -702,6 +797,15 @@ class LoadBalancer:
             return ProbabilisticCascadeAutellixStrategy(
                 short_request_threshold=LOAD_BALANCER_SHORT_REQUEST_THRESHOLD
             )
+        
+        if name == "ordered-dynamic-autellix-reorder":
+            return OrderedReorderDynamicAutellixStrategy(LOAD_BALANCER_SHORT_REQUEST_THRESHOLD)
+        
+        if name == "probabilistic-cascade-autellix-reorder":
+            return ProbabilisticReorderCascadeAutellixStrategy(
+                short_request_threshold=LOAD_BALANCER_SHORT_REQUEST_THRESHOLD
+            )
+        
         # ------------------------
         # Safe Default
         # ------------------------
@@ -709,8 +813,16 @@ class LoadBalancer:
 
 
       
-    async def select_engine(self, program_id: Optional[str], num_input_tokens: int) -> str:
+    async def select_engine(self, program_id: Optional[str], num_input_tokens: int) -> str: 
         metrics = self._get_cached_metrics()
+        
+        # INJEÇÃO EM TEMPO REAL: Pega as requisições em execução no exato milissegundo
+        if hasattr(PROCESS_TABLE, "get_engine_running_counts"):
+            running_counts = PROCESS_TABLE.get_engine_running_counts()
+            for engine in ALL_BACKENDS:
+                metrics.setdefault(engine, {})
+                metrics[engine]["pt_running"] = running_counts.get(engine, 0)
+
         return await self.strategy.select_engine(program_id, num_input_tokens, metrics)
 
     

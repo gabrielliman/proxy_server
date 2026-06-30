@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 import uvicorn
 
@@ -10,10 +11,9 @@ from routing.load_balancer import LOAD_BALANCER
 from config.settings import PROCESS_TABLE_PRUNE_TTL, PROCESS_TABLE_PRUNE_INTERVAL
 
 
-app = FastAPI()
-
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- STARTUP LOGIC ---
     start_monitoring_tasks(app)
     # start process table pruner
     # PROCESS_TABLE.start_async_pruner(PROCESS_TABLE_PRUNE_INTERVAL, PROCESS_TABLE_PRUNE_TTL)
@@ -24,15 +24,17 @@ async def startup_event():
         # don't fail startup if collector can't start
         pass
 
+    yield  # Application runs while paused here
 
-@app.on_event("shutdown")
-async def shutdown_event():
+    # --- SHUTDOWN LOGIC ---
     # PROCESS_TABLE.stop_async_pruner()
     try:
         await LOAD_BALANCER.stop_metrics_collector()
     except Exception:
         pass
 
+
+app = FastAPI(lifespan=lifespan)
 
 app.include_router(chat_router)
 app.include_router(completion_router)
@@ -41,4 +43,3 @@ app.include_router(status_router)
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8081)
-

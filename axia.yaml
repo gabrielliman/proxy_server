@@ -3,7 +3,7 @@ version: 1.1
 kind: operation
 tags: [examples, bash]
 queue: axia/default
-name: atlas_service_100prog_50it_5gen_rate8_bur01_1threshold
+name: atlas_service_50prog_10it_100gen_rate8_bur01_100thres_2048out_150parall
 component:
   kind: component
   run:
