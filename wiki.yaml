@@ -1,0 +1,32 @@
+# Arquivo polyaxon_job.yaml
+version: 1.1
+kind: operation
+tags: [examples, bash]
+queue: axia/default
+name: wikipedia
+component:
+  kind: component
+  run:
+    kind: job
+    # Permite o uso de /scratch
+    connections: [local-scratch] #, axia-artifacts]
+
+    container:
+
+      securityContext:
+        capabilities:
+          add: 
+            - "SYS_RESOURCE"
+
+      image: gabrielliman/proxy_server:latest
+
+      # Diretório inicial: local onde foi feito os uploads
+      workingDir: "{{ globals.artifacts_path }}/{{ globals.uuid }}/uploads"
+
+      # Neste exemplo é mostrado o diretório corrente, as GPUs alocadas e o
+      # storage local da axia, /scratch, que pode ser usado por qualquer
+      # job ou usuário.
+      # command: ["bash", "-c", "set -x; pwd; ls; ls /scratch; bash my_script.sh"]
+      command: ["bash", "-c", "set -x; bash download_wiki.sh"]
+      # command: ["bash", "-c", "set -x; pwd; ls; ls /scratch;"]
+      # Defina ambos 'requests' e 'limits' para asegurar alocação exclusiva.

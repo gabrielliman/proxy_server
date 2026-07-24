@@ -1,47 +1,50 @@
 #!/bin/bash
 
+ulimit -n 524288
+
 #Model Parameters
 MODEL_NAME="meta-llama/Llama-3.1-8B-Instruct"
 MODEL_PATH="/scratch/hpc4ai/models/llama/Llama-3.1-8B-Instruct"
-MAX_NUM_SEQS=100
+MAX_NUM_SEQS=10
 LOG_DIR="./var/logs"
 
 # Number of instances parameters
 NUM_INSTANCES=16       # Change this to the number of ports you want
 START_PORT=8105        # The starting port number
-PARALLELISM_VALUE=150   # The parallelism value for all ports
+PARALLELISM_VALUE=15   # The parallelism value for all ports
 GPU=0 #starting gpu
 ENGINE_IDX=1  # Counter to create PID1, PID2, etc.
 PER_GPU=4
-GPU_PERCENT=0.20
+GPU_PERCENT=0.15
 # Lats parameters
+
 BASE_URL="http://localhost:8081" #proxy server url
 ALGORITHM="lats"
 START_INDEX=900
-END_INDEX=950
+END_INDEX=910
 ITERATIONS=10
-N_GENERATE=100 #5
+N_GENERATE=10 #5
 N_EVALUATE=1
+DEPTH=14
 
 # Benchmark parameters
-OUTPUTS_DIR="outputs_lats/atlas_service_50prog_10it_100gen_rate8_bur01_100thres_2048out_150parall"
-REPEATS=10
+OUTPUTS_DIR="outputs_lats/atlas_service_500prog_10it_100gen_rate8_bur01_100thres_2048out_100parall_depth7"
+REPEATS=1
 RATES=("8")
 # RATES=("0.5" "1" "2" "4" "8")
 BURSTINESS=0.1
 BASELINE_SCHEDULER=autellix
 EXPERIMENT_CONFIGS=(
     #baseline fcfs
-    # "fcfs:N/A:least-total-load:N/A:0"
+    # "atlas:service_cumulative:least-total-load:N/A:0"
     #baseline autellix
     # "atlas:service_cumulative:autellix:N/A:0"
-    "atlas:service_cumulative:threshold-autellix:total:15"
-    "atlas:service_cumulative:ordered-dynamic-autellix:N/A:0"
-    "atlas:service_cumulative:least-load-dynamic-autellix:N/A:0"
-    "atlas:service_cumulative:probabilistic-cascade-autellix:N/A:0"
-    "atlas:service_cumulative:ordered-dynamic-autellix-reorder:N/A:0"
-    "atlas:service_cumulative:probabilistic-cascade-autellix-reorder:N/A:0"
-
+    # "atlas:service_cumulative:threshold-autellix:total:15"
+    # "atlas:service_cumulative:ordered-dynamic-autellix:N/A:0"
+    # "atlas:service_cumulative:least-load-dynamic-autellix:N/A:0"
+    # "atlas:service_cumulative:probabilistic-cascade-autellix:N/A:0"
+    # "atlas:service_cumulative:ordered-dynamic-autellix-reorder:N/A:0"
+    # "atlas:service_cumulative:probabilistic-cascade-autellix-reorder:N/A:0"
 
     #nossa proposta escalonador
     # "atlas:kv_token_time:autellix:N/A:0"
@@ -64,6 +67,7 @@ SCHEDULER_CONFIGS=(
 
 source /opt/conda/etc/profile.d/conda.sh && conda activate proxy_server
 set -x
+
 # ## arruma um dos warning, mas nao entendi direito
 FLASHINFER_DIR="/opt/conda/envs/proxy_server/lib/python3.12/site-packages/flashinfer/data/include/flashinfer/comm"
 
@@ -289,6 +293,7 @@ for sched_conf in "${SCHEDULER_CONFIGS[@]}"; do
                 --output-json $OUTPUT_JSON \
                 --burstiness $BURSTINESS \
                 --program-rate "$rate" \
+                --depth_limit "$DEPTH" \
                 --is_baseline_run 1 2> "$OUTPUT_ERROR"
             #Matando o proxy
             PROG_FILE="${OUTPUTS_DIR}/baseline_processes_summary_${sched_suffix}_autellix_rate${rate}_run${RUN}.json"
@@ -449,6 +454,7 @@ for config in "${EXPERIMENT_CONFIGS[@]}"; do
                     --output-json $OUTPUT_JSON \
                     --burstiness $BURSTINESS \
                     --program-rate "$rate" \
+                    --depth_limit "$DEPTH" \
                     --is_baseline_run 0 2> "$OUTPUT_ERROR"
                 # ------------------------------------
                 # AFTER metrics + compute delta

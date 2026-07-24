@@ -6,6 +6,8 @@ import wikienv, wrappers
 import requests
 import logging
 import random
+import concurrent.futures
+import time
 
 def step(env, action):
     attempts = 0
@@ -35,7 +37,6 @@ def get_value(task, x, y, n_evaluate_sample, failed_trajectories, reflection_map
         task.value_cache[value_prompt] = value
     return value
 
-import concurrent.futures
 
 def get_values(task, x, ys, n_evaluate_sample, failed_trajectories, reflection_map, cache_value=True, program_id="default_prog"):
     values = []
@@ -177,6 +178,21 @@ def lats_search(args, task, idx, iterations=30, to_print=True, program_id="defau
     env = wrappers.HotPotQAWrapper(env, split="train")
     env = wrappers.LoggingWrapper(env)
     
+    def get_search_stats(current_env):
+        # Desempacota as camadas do ambiente
+        original_env = current_env
+        while hasattr(current_env, 'env'):
+            current_env = current_env.env
+            
+        time_info = current_env.get_time_info()
+        time_info["cache_hits"] = time_info.get("cache_hits", None)
+        time_info["cache_misses"] = time_info.get("cache_misses", None)
+        
+        # Resgata o tempo real de caminho crítico que injetamos (ou 0 se nenhuma busca foi feita)
+        time_info["lats_critical_path_time"] = getattr(original_env, 'lats_real_time', 0.0)
+        
+        return time_info
+    
     x = env.reset(idx=idx)
     if to_print:
         print(f"[{program_id}] {idx}", x)
@@ -205,7 +221,8 @@ def lats_search(args, task, idx, iterations=30, to_print=True, program_id="defau
 
         if node.is_terminal and node.reward == 1:
             logging.info(f"[{program_id}] Terminal node with reward 1 found at iteration {i + 1}")
-            return node.state, node.value, all_nodes, node.reward, node.em
+            time_info = get_search_stats(env)
+            return node.state, node.value, all_nodes if all_nodes else [node], node.reward, node.em, time_info
         
         expand_node(node, args, task, env, failed_trajectories, reflection_map, program_id)
 
@@ -223,7 +240,8 @@ def lats_search(args, task, idx, iterations=30, to_print=True, program_id="defau
 
         if terminal_node.reward == 1:
             logging.info(f"[{program_id}] SUCCESSFUL TRAJECTORY FOUND DURING SIMULATION")
-            return terminal_node.state, terminal_node.value, [], terminal_node.reward, terminal_node.em
+            time_info = get_search_stats(env)
+            return terminal_node.state, terminal_node.value, [terminal_node], terminal_node.reward, terminal_node.em, time_info
 
         backpropagate(terminal_node, reward, program_id)
         all_nodes = [(node, node.value) for node in collect_all_nodes(root)]
@@ -233,7 +251,8 @@ def lats_search(args, task, idx, iterations=30, to_print=True, program_id="defau
         if terminal_nodes_with_reward_1:
             logging.info(f"[{program_id}] Terminal node with reward 1 found at iteration {i + 1}")
             best_node = max(terminal_nodes_with_reward_1, key=lambda x: x.value)
-            return best_node.state, best_node.value, all_nodes, best_node.reward, best_node.em
+            time_info = get_search_stats(env)
+            return best_node.state, best_node.value, all_nodes if all_nodes else [best_node], best_node.reward, best_node.em, time_info
     
         for j, (n, v) in enumerate(all_nodes):
             logging.info(f"[{program_id}] Node {j+1}: {str(n)}")
@@ -251,7 +270,8 @@ def lats_search(args, task, idx, iterations=30, to_print=True, program_id="defau
         
     if best_child is None:
         best_child = root
-    return best_child.state, best_child.value, all_nodes, best_child.reward, best_child.em
+    time_info = get_search_stats(env)
+    return best_child.state, best_child.value, all_nodes_list, best_child.reward, best_child.em, time_info
 
 def select_node(node, program_id="default_prog"):
     # print(f"[{program_id}] 1) SELECTION: Selecionando nó na profundidade {node.depth}")
@@ -278,13 +298,15 @@ def select_node(node, program_id="default_prog"):
             node = max((child for child in node.parent.children if not child.is_terminal), key=lambda child: child.uct(), default=None)
             
         logging.info(f"[{program_id}] Selected node at depth {node.depth} with UCT {node.uct()}.")
+
         
     return node  # This will return None if all paths from the root are exhausted
 
 def expand_node(node, args, task, env, failed_trajectories, reflection_map, program_id="default_prog"):
-    if node.depth >= 7:
+    # print("LIMITE PROFUNDIADE:",args.depth_limit)
+    if node.depth >= args.depth_limit:
         logging.info(f"[{program_id}] Depth limit reached")
-        # print(f"[{program_id}] Depth limit reached")
+        print(f"[{program_id}] Depth limit reached")
         node.is_terminal = True
         return
     new_nodes = generate_new_states(node, args, task, args.n_generate_sample, env, failed_trajectories, reflection_map, program_id)
@@ -351,8 +373,14 @@ def generate_new_states(node, args, task, n, env, failed_trajectories, reflectio
             action_type = action_line.split('[')[0] if '[' in action_line else action_line
             action_param = action_line.split('[')[1].split(']')[0] if '[' in action_line else ""
 
+            inicio_step = time.time()
+            
             obs, r, done, info = step(env, f"{action_type.lower()}[{action_param}]")
-
+            
+            tempo_step = time.time() - inicio_step
+            if not hasattr(env, 'lats_real_time'):
+                env.lats_real_time = 0.0
+            env.lats_real_time += tempo_step
             # Update the new state dictionary
             new_state['thought'] = thought_line
             new_state['action'] = action_line

@@ -1,9 +1,10 @@
 # Arquivo polyaxon_job.yaml
 version: 1.1
 kind: operation
-tags: [examples, bash]
+# tags: [examples]
+tags: [examples, lowmem, llama, 30parall, 100prog, rate01, nocache]
 queue: axia/default
-name: atlas_service_50prog_10it_100gen_rate8_bur01_100thres_2048out_150parall
+name: nocache_our_llama_100prog_50it_100gen_30parall_rate01
 component:
   kind: component
   run:
@@ -13,6 +14,10 @@ component:
     connections: [local-scratch] #, axia-artifacts]
 
     container:
+      securityContext:
+        capabilities:
+          add: 
+            - "SYS_RESOURCE"
       # Pode adicionar qualquer imagem dockerhub
       image: gabrielliman/proxy_server:latest
 
@@ -22,12 +27,12 @@ component:
       # Neste exemplo é mostrado o diretório corrente, as GPUs alocadas e o
       # storage local da axia, /scratch, que pode ser usado por qualquer
       # job ou usuário.
-      # command: ["bash", "-c", "set -x; pwd; ls; ls /scratch; bash my_script.sh"]
-      command: ["bash", "-c", "set -x; nvidia-smi; bash polyaxon_new_lats_benchmark.sh"]
+      # command: ["bash", "-c", "set -x; pwd; ls;  bash start_model_polyaxon.sh"]
+      command: ["bash", "-c", "set -x; nvidia-smi; bash polyaxon_llama_low_memory.sh"]
       # command: ["bash", "-c", "set -x; pwd; ls; ls /scratch;"]
       # Defina ambos 'requests' e 'limits' para asegurar alocação exclusiva.
       resources:
         requests:
-          nvidia.com/gpu: 4
+          nvidia.com/gpu: 3
         limits:
-          nvidia.com/gpu: 4
+          nvidia.com/gpu: 3

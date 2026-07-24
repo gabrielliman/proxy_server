@@ -15,3 +15,6 @@ start_vllm.sh
 .env
 *.log
 *.zip
+*.db
+*.tar.gz
+Testes*

@@ -2,5 +2,12 @@ __pycache__
 var/logs/*
 outputs/*
 outputs_lats/*
+new_outputs_lats/*
+Testes4Engines/*
 docker/*
 LanguageAgentTreeSearch/hotpot/results/*
+wiki_cache_db.sqlite
+*.sqlite
+*.ipynb
+*.db
+Testes*

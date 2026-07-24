@@ -3,12 +3,13 @@ export CUSTOM_MODEL="meta-llama/Llama-3.1-8B-Instruct"
 python LanguageAgentTreeSearch/hotpot/run.py \
   --algorithm lats \
   --task_start_index 900 \
-  --task_end_index 902 \
+  --task_end_index 901 \
   --iterations 3 \
-  --log logs/lats_smoke_test.log \
-  --n_generate_sample 30 \
+  --log ./logs_lats/lats_smoke_test.log \
+  --n_generate_sample 5 \
   --n_evaluate_sample 1 \
-  --program-rate 0.5
+  --program-rate 0.5 \
+  --output-json ./teste.json
 # python run.py \
 #     --backend gpt-3.5-turbo \
 #     --task_start_index 0 \

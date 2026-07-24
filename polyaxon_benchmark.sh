@@ -1,5 +1,6 @@
 #!/bin/bash
 # START VLLM SERVERS
+ulimit -n 524288
 
 source /opt/conda/etc/profile.d/conda.sh && conda activate proxy_server
 set -x

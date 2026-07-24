@@ -14,7 +14,7 @@ import logging
 from hotpotqa import HotPotQATask
 import models # Para acessar models.PROGRAM_METRICS_REGISTRY e models.REQUEST_SEND_TIMES
 from models import gpt_usage, ProgramMetrics
-from lats import lats_search
+from lats import lats_search, generate_prompt
 from tot import dfs_search
 from rap import mcts_search
 
@@ -69,17 +69,9 @@ def summarize_program(prog: ProgramMetrics) -> Dict[str, Any]:
         "output_token_throughput": safe_div(total_output_tokens, total_latency),
         "total_token_throughput": safe_div(total_tokens, total_latency),
 
-        # "mean_ttft_ms": float(np.mean(ttfts)) * 1000 if ttfts else None,
-        # "median_ttft_ms": float(np.median(ttfts)) * 1000 if ttfts else None,
-        # "p99_ttft_ms": percentile(ttfts, 99) * 1000 if ttfts else None,
-
         "mean_tpot_ms": float(np.mean(tpots)) * 1000 if tpots else None,
         "median_tpot_ms": float(np.median(tpots)) * 1000 if tpots else None,
         "p99_tpot_ms": percentile(tpots, 99) * 1000 if tpots else None,
-
-        # "mean_itl_ms": float(np.mean(itls)) * 1000 if itls else None,
-        # "median_itl_ms": float(np.median(itls)) * 1000 if itls else None,
-        # "p99_itl_ms": percentile(itls, 99) * 1000 if itls else None,
 
         "mean_e2el_ms": float(np.mean(latencies)) * 1000 if latencies else None,
         "median_e2el_ms": float(np.median(latencies)) * 1000 if latencies else None,
@@ -322,7 +314,7 @@ class RateLimiter:
 def execute_tree_sync(args, task, program_id, idx):
     logging.info(f"[{program_id}] Iniciando busca para questão {idx}...")
     if args.algorithm == 'lats':
-        state, value, all_nodes, reward, em = lats_search(args, task, idx, args.iterations, True, program_id=program_id)
+        state, value, all_nodes, reward, em, time_info = lats_search(args, task, idx, args.iterations, True, program_id=program_id)
     elif args.algorithm == 'tot':
         state, value, all_nodes, reward, em = dfs_search(args, task, idx, args.iterations)
     elif args.algorithm == 'rap':
@@ -330,7 +322,7 @@ def execute_tree_sync(args, task, program_id, idx):
     else:
         raise Exception("Search algorithm option not valid")
         
-    return program_id, idx, em, reward
+    return program_id, idx, em, reward, all_nodes, time_info
 
 # ============================================================
 # Orquestrador Assíncrono Principal
@@ -345,21 +337,95 @@ async def run_async_orchestrator(args):
     
     tasks = []
     task_accs = []
-    
+
     start_time = time.perf_counter()
 
     with ThreadPoolExecutor(max_workers=1000000) as executor:
         for i in range(args.task_start_index, args.task_end_index):
             await rate_limiter.acquire()
             program_id = f"prog_{i}"
+            
             future = loop.run_in_executor(executor, execute_tree_sync, args, task, program_id, i)
             tasks.append(future)
 
         results = await asyncio.gather(*tasks)
-
+    
     total_wall = time.perf_counter() - start_time
+    program_max_depths = {}
+    program_wiki_stats = {}
+    tree_dumped = True
+    for prog_id, idx, em, reward, all_nodes, time_info in results:
+        program_wiki_stats[prog_id] = {
+            "search_time_s": time_info.get("call_time", 0),
+            "num_searches": time_info.get("num_calls", 0),
+            "call_speed": time_info.get("call_speed", 0),
+            "cache_hits": time_info.get("cache_hits", None),
+            "cache_misses": time_info.get("cache_misses", None),
+            "lats_critical_path_time": time_info.get("lats_critical_path_time", 0.0) # <--- NOVA LINHA
+        }
+        if all_nodes:
+            # Pega a lista de nós limpa (lidando com tuplas se houver)
+            nodes_list = [n[0] if isinstance(n, tuple) else n for n in all_nodes]
+            # Acha o maior depth na lista de nós (ou 0 se estiver vazia)
+            max_depth = max((node.depth for node in nodes_list), default=0)
+        else:
+            max_depth = 0
 
-    for prog_id, idx, em, reward in results:
+        program_max_depths[prog_id] = max_depth
+        
+        if all_nodes and not tree_dumped:
+            tree_file = f"{prog_id}_tree_analysis.txt"
+            with open(tree_file, "w", encoding="utf-8") as f:
+                f.write(f"Tree Content Breakdown for {prog_id} (Task Index: {idx})\n")
+                f.write("="*70 + "\n\n")
+
+                nodes_list = [n[0] if isinstance(n, tuple) else n for n in all_nodes]
+
+                for i, node in enumerate(nodes_list):
+                    full_request = generate_prompt(node)
+                    
+                    # 1. Determine what belongs to the parent (Heritage) vs the Child (New)
+                    if node.parent:
+                        heritage_text = generate_prompt(node.parent)
+                        # Safely extract only what this specific node appended
+                        if full_request.startswith(heritage_text):
+                            new_text = full_request[len(heritage_text):].lstrip('\n')
+                        else:
+                            # Fallback alignment protection
+                            new_text = (f"Thought {node.depth}: {node.state['thought']}\n"
+                                        f"Action {node.depth}: {node.state['action']}\n"
+                                        f"Observation {node.depth}: {node.state['observation']}")
+                    else:
+                        # Node 0 (Root) has no parent heritage; the initial question is the new content
+                        heritage_text = ""
+                        new_text = full_request
+
+                    # 2. Calculate percentages based on character length
+                    total_len = len(full_request)
+                    heritage_len = len(heritage_text)
+                    new_len = total_len - heritage_len
+
+                    heritage_pct = (heritage_len / total_len * 100) if total_len > 0 else 0
+                    new_pct = (new_len / total_len * 100) if total_len > 0 else 0
+
+                    # 3. Write out the structured breakdown
+                    f.write(f"--- NODE {i} (Depth: {node.depth} | Value: {node.value:.2f} | Reward: {node.reward}) ---\n")
+                    f.write(f"METRICS:\n")
+                    f.write(f"  └─ Heritage Content (From Ancestors): {heritage_pct:.1f}% ({heritage_len} chars)\n")
+                    f.write(f"  └─ New Content (Added by This Step):  {new_pct:.1f}% ({new_len} chars)\n\n")
+                    
+                    if node.parent:
+                        f.write(f"[SHOWING NEW CONTENT ADDED AT THIS DEPTH]:\n")
+                        f.write(new_text + "\n")
+                    else:
+                        f.write(f"[ROOT NODE - INITIAL QUESTION]:\n")
+                        f.write(new_text + "\n")
+                        
+                    f.write("-" * 70 + "\n\n")
+            
+            print(f"\n[SUCCESS] Content metrics for {prog_id} exported to {tree_file}")
+            tree_dumped = True
+        
         em_val = 0 if em is None else em
         task_accs.append(em_val)
         
@@ -386,7 +452,7 @@ async def run_async_orchestrator(args):
                 if data[1] is not None:
                     service_time = float(data[1])
                 else:
-                    waiting_time=-1
+                    service_time = -1
         program_results.append(ProgramMetrics(program_id=pid, requests=reqs, waiting_time=waiting_time, service_time=service_time))
 
     per_program_metrics = [summarize_program(p) for p in program_results]
@@ -405,6 +471,23 @@ async def run_async_orchestrator(args):
         path=args.output_json, is_baseline=args.is_baseline_run
     )
 
+    for p in per_program_metrics:
+        p["max_depth_reached"] = program_max_depths.get(p["program_id"], 0)
+        
+        stats = program_wiki_stats.get(p["program_id"], {})
+        p["wiki_search_time_s"] = stats.get("search_time_s", 0)
+        p["wiki_num_searches"] = stats.get("num_searches", 0)
+        p["wiki_call_speed"] = stats.get("call_speed", 0)
+        p["wiki_cache_hits"] = stats.get("cache_hits", None)
+        p["wiki_cache_misses"] = stats.get("cache_misses", None)
+        p["lats_critical_path_time_s"] = stats.get("lats_critical_path_time", 0.0) # <--- NOVA LINHA
+
+    # --- OPCIONAL: Adicionar médias de profundidade nas métricas gerais (full_metrics) ---
+    if program_max_depths:
+        depths_array = list(program_max_depths.values())
+        full_metrics["mean_max_depth"] = float(np.mean(depths_array))
+        full_metrics["absolute_max_depth_overall"] = int(np.max(depths_array))
+    
     # Aggregação E2EL por programa
     e2el_values = np.array([p["total_e2el_s"] for p in per_program_metrics if p.get("total_e2el_s") is not None], dtype=float)
     if e2el_values.size:
@@ -447,6 +530,25 @@ async def run_async_orchestrator(args):
         full_metrics["p99_service_time_per_program"] = float(np.percentile(service_time, 99))
         full_metrics["total_service_time_s"] = float(np.sum(service_time))
 
+    # Calculate totals for cache hits and misses, ignoring None values
+    valid_hits = [p["wiki_cache_hits"] for p in per_program_metrics if p.get("wiki_cache_hits") is not None]
+    valid_misses = [p["wiki_cache_misses"] for p in per_program_metrics if p.get("wiki_cache_misses") is not None]
+
+    if valid_hits:
+        full_metrics["total_cache_hits"] = sum(valid_hits)
+    if valid_misses:
+        full_metrics["total_cache_misses"] = sum(valid_misses)
+
+    # Calculate overall Wiki environment statistics
+    total_wiki_searches = sum(p.get("wiki_num_searches", 0) for p in per_program_metrics)
+    total_wiki_search_time = sum(p.get("wiki_search_time_s", 0) for p in per_program_metrics)
+    total_lats_critical_path_time = sum(p.get("lats_critical_path_time_s", 0.0) for p in per_program_metrics) # <--- NOVA LINHA
+    
+    full_metrics["total_wiki_searches"] = total_wiki_searches
+    full_metrics["total_wiki_search_time_s"] = total_wiki_search_time
+    full_metrics["total_lats_critical_path_time_s"] = total_lats_critical_path_time # <--- NOVA LINHA
+    full_metrics["overall_wiki_call_speed"] = (total_wiki_search_time / total_wiki_searches) if total_wiki_searches > 0 else 0
+    
 
     full_metrics["total_e2el_s"] = total_wall
     full_metrics["num_programs"] = len(program_results)
@@ -524,6 +626,9 @@ def parse_args():
     # NOVOS ARGUMENTOS DE MÉTRICA
     args.add_argument('--output-json', type=str, default=None, help='Caminho para salvar o JSON gerado')
     args.add_argument('--is_baseline_run', type=int, default=0, help='0 = Falso, 1 = Verdadeiro (para cálculo de Thresholds)')
+
+    #limite profundidade
+    args.add_argument('--depth_limit', type=int, default=7, help='Limite de profundidade para a busca (apenas para LATS)')
 
     parsed = args.parse_args()
     parsed.is_baseline_run = bool(parsed.is_baseline_run)

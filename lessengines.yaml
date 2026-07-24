@@ -1,0 +1,38 @@
+# Arquivo polyaxon_job.yaml
+version: 1.1
+kind: operation
+# tags: [examples]
+tags: [examples, lowmem, llama, 30parall, 100prog, rate01, nocache]
+queue: axia/default
+name: our_llama_200prog_50it_5gen_30parall_rateinf_deph7
+component:
+  kind: component
+  run:
+    kind: job
+
+    # Permite o uso de /scratch
+    connections: [local-scratch] #, axia-artifacts]
+
+    container:
+      securityContext:
+        capabilities:
+          add: 
+            - "SYS_RESOURCE"
+      # Pode adicionar qualquer imagem dockerhub
+      image: gabrielliman/proxy_server:latest
+
+      # Diretório inicial: local onde foi feito os uploads
+      workingDir: "{{ globals.artifacts_path }}/{{ globals.uuid }}/uploads"
+
+      # Neste exemplo é mostrado o diretório corrente, as GPUs alocadas e o
+      # storage local da axia, /scratch, que pode ser usado por qualquer
+      # job ou usuário.
+      # command: ["bash", "-c", "set -x; pwd; ls;  bash start_model_polyaxon.sh"]
+      command: ["bash", "-c", "set -x; nvidia-smi; bash lessengines.sh"]
+      # command: ["bash", "-c", "set -x; pwd; ls; ls /scratch;"]
+      # Defina ambos 'requests' e 'limits' para asegurar alocação exclusiva.
+      resources:
+        requests:
+          nvidia.com/gpu: 1
+        limits:
+          nvidia.com/gpu: 1

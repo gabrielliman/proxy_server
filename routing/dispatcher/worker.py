@@ -8,7 +8,7 @@ from routing.queue_manager import get_queue, put_request, get_request
 from config.settings import REQUEST_TIMEOUT, BACKEND_PARALLELISM, ALL_BACKENDS, SCHEDULER, MODEL
 from utils.tokenizer_utils import get_tokenizer
 from routing.load_balancer import LOAD_BALANCER
-
+from fastapi import HTTPException
 
 class WorkerPoolDispatcher(BaseDispatcher):
     workers_started = False
@@ -25,14 +25,14 @@ class WorkerPoolDispatcher(BaseDispatcher):
         timeout_config = httpx.Timeout(
             connect=30.0,      
             read=300.0,        
-            write=30.0,        
-            pool=30.0
+            write=10.0,        
+            pool=10.0
         )
 
         limits = httpx.Limits(
             max_keepalive_connections=500, 
             max_connections=2000,
-            keepalive_expiry=30.0
+            keepalive_expiry=3.0
         )
 
         WorkerPoolDispatcher.shared_client = httpx.AsyncClient(
@@ -102,18 +102,45 @@ class WorkerPoolDispatcher(BaseDispatcher):
                         # O tempo de execução real só começa quando passa do semáforo
                         PROCESS_TABLE.record_call_start(pid, cid, engine_id=backend, start_time=time.time())
 
-                    resp = await client.post(f"{backend}/v1/chat/completions", json=data)
-                    resp_json = resp.json()
-                    
-                    if resp_json and "choices" in resp_json:
-                        choice = resp_json["choices"][0] if resp_json["choices"] else {}
-                        text = choice.get("message", {}).get("content", "") or choice.get("text", "")
-                        if text:
-                            tok = get_tokenizer()
-                            output_tokens = len(tok.encode(text, add_special_tokens=False))
+                    max_retries = 5
+                    for attempt in range(max_retries):
+                        try:
+                            resp = await client.post(f"{backend}/v1/chat/completions", json=data)
+                            resp.raise_for_status()  # Garante que erros 500/502 da engine disparem exceção
+                            resp_json = resp.json()
+                            
+                            if resp_json and "choices" in resp_json:
+                                choice = resp_json["choices"][0] if resp_json["choices"] else {}
+                                text = choice.get("message", {}).get("content", "") or choice.get("text", "")
+                                if text:
+                                    tok = get_tokenizer()
+                                    output_tokens = len(tok.encode(text, add_special_tokens=False))
 
-                if not future.done():
-                    future.set_result(resp_json)
+                            if not future.done():
+                                future.set_result(resp_json)
+                                
+                            break  # Sucesso! Interrompe o loop de retries
+                        except httpx.TimeoutException as e:
+                            # Timeout significa que o backend está sobrecarregado. Não faça retry cego.
+                            print(f"[WORKER TIMEOUT] Engine {backend} não respondeu a tempo: {e}")
+                            raise e
+                    
+                        except httpx.RequestError as e:  # Captura falhas de rede como ReadError e ConnectError
+                            print(f"[WORKER RETRY] Falha de rede na engine {backend} (Tentativa {attempt + 1}/{max_retries}): {e}")
+                            if attempt == max_retries - 1:
+                                raise e  # Se esgotaram as tentativas, repassa o erro para o bloco 'except' principal
+                            await asyncio.sleep(0.5)  # Pausa de meio segundo antes da próxima tentativa
+                            
+                        except Exception as e:
+                            print(f"[WORKER ERROR] {e}")
+                            if not future.done():
+                                # Translate httpx timeouts into graceful 504 errors for FastAPI
+                                if isinstance(e, httpx.TimeoutException):
+                                    future.set_exception(
+                                        HTTPException(status_code=504, detail="Backend engine timed out while generating response.")
+                                    )
+                                else:
+                                    future.set_exception(e)
 
             except Exception as e:
                 print(f"[WORKER ERROR] {e}")
