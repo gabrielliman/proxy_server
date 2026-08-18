@@ -8,6 +8,24 @@ import logging
 import random
 import concurrent.futures
 import time
+import os
+
+API_BASE = os.getenv("CUSTOM_API_BASE", "http://localhost:8000")
+
+def notify_program_completion(program_id, idx, status, time_info=None):
+    payload = {
+        "program_id": program_id,
+        "task_idx": idx,
+        "status": status,
+        "time_info": time_info
+    }
+    try:
+        url = f"{API_BASE}/program/complete"
+        response = requests.post(url, json=payload, timeout=5)
+        response.raise_for_status()
+        logging.info(f"[{program_id}] Sinal de término enviado com sucesso: {response.status_code}")
+    except Exception as e:
+        logging.error(f"[{program_id}] Falha ao enviar sinal de término: {e}")
 
 def step(env, action):
     attempts = 0
@@ -38,7 +56,7 @@ def get_value(task, x, y, n_evaluate_sample, failed_trajectories, reflection_map
     return value
 
 
-def get_values(task, x, ys, n_evaluate_sample, failed_trajectories, reflection_map, cache_value=True, program_id="default_prog"):
+def get_values(task, x, ys, n_evaluate_sample, failed_trajectories, reflection_map, cache_value=True, program_id="default_prog", step_stats=None, phase="expansion"):
     values = []
     local_value_cache = {}
     
@@ -47,6 +65,11 @@ def get_values(task, x, ys, n_evaluate_sample, failed_trajectories, reflection_m
     for y in ys:
         if y not in unique_ys:
             unique_ys.append(y)
+    if step_stats is not None:
+        if phase == "expansion":
+            step_stats["start_evaluation_requests"] += len(unique_ys) * n_evaluate_sample
+        elif phase == "rollout":
+            step_stats["rollout_evaluation_requests"] += len(unique_ys) * n_evaluate_sample
 
     # Função auxiliar para enviar ao ThreadPool
     def fetch_value(y):
@@ -67,7 +90,12 @@ def get_values(task, x, ys, n_evaluate_sample, failed_trajectories, reflection_m
         
     return values
 
-def get_samples(task, x, y, n_generate_sample, prompt_sample, stop, failed_trajectories, reflection_map, program_id="default_prog"):
+def get_samples(task, x, y, n_generate_sample, prompt_sample, stop, failed_trajectories, reflection_map, program_id="default_prog", step_stats=None, phase="expansion"):
+    if step_stats is not None:
+        if phase == "expansion":
+            step_stats["start_expansion_requests"] += n_generate_sample
+        elif phase == "rollout":
+            step_stats["rollout_expansion_requests"] += n_generate_sample   
     unique_trajectories = get_unique_trajectories(failed_trajectories)
     if len(unique_trajectories) > len(reflection_map) and len(unique_trajectories) < 4:
         # print(f"[{program_id}] 6) REFLECTION: Gerando reflexão sobre trajetória falha...")
@@ -206,44 +234,79 @@ def lats_search(args, task, idx, iterations=30, to_print=True, program_id="defau
     reflection_map = []
     
     logging.basicConfig(filename=args.log, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', filemode='a')
+    step_stats = {
+        "selection_time_s": 0.0,
+        "expansion_time_s": 0.0,
+        "evaluation_time_s": 0.0,
+        "rollout_time_s": 0.0,
+        "backprop_time_s": 0.0,
+        "start_expansion_requests": 0,    # NOVO
+        "start_evaluation_requests": 0,   # NOVO
+        "rollout_expansion_requests": 0,  # NOVO
+        "rollout_evaluation_requests": 0  # NOVO
+    }
+
+    iterations_used = 0
 
     for i in range(iterations):
+        if getattr(args, 'kill_event', None) and args.kill_event.is_set():
+            logging.info(f"[{program_id}] Kill event detected! Stopping iterations.")
+            notify_program_completion(program_id, idx, status="interrupted")
+            raise InterruptedError("Hard stopped by orchestrator timeout")
         logging.info(f"[{program_id}] Iteration {i + 1}...")
+        iterations_used = i + 1
+        
+        # Medindo Selection
+        t0 = time.time()
         node = select_node(root, program_id)
-
+        
         while node is None or (node.is_terminal and node.reward != 1):
-            logging.info(f"[{program_id}] Need to backtrack or terminal node with reward 0 found at iteration {i + 1}, reselecting...")
+            logging.info(f"[{program_id}] Need to backtrack...")
             node = select_node(root, program_id)
+        step_stats["selection_time_s"] += time.time() - t0
         
         if node is None:
-            logging.info(f"[{program_id}] All paths lead to terminal nodes with reward 0. Ending search.")
             break
 
         if node.is_terminal and node.reward == 1:
-            logging.info(f"[{program_id}] Terminal node with reward 1 found at iteration {i + 1}")
             time_info = get_search_stats(env)
+            time_info.update(step_stats) # Adiciona as métricas ao retorno
+            time_info["iterations_used"] = iterations_used
+            notify_program_completion(program_id, idx, status="success_selection", time_info=time_info)
             return node.state, node.value, all_nodes if all_nodes else [node], node.reward, node.em, time_info
         
-        expand_node(node, args, task, env, failed_trajectories, reflection_map, program_id)
-
-        while node.is_terminal or not node.children:
-            logging.info(f"[{program_id}] Depth limit node found at iteration {i + 1}, reselecting...")
-            node = select_node(root, program_id)
-            expand_node(node, args, task, env, failed_trajectories, reflection_map, program_id)
-
-        value = evaluate_node(node, args, task, failed_trajectories, reflection_map, program_id)
+        # Medindo Expansion
+        t0 = time.time()
+        expand_node(node, args, task, env, failed_trajectories, reflection_map, program_id, step_stats)
         
-        # Find the child with the highest value
-        reward, terminal_node = rollout(max(node.children, key=lambda child: child.value), args, task, idx, env, failed_trajectories, reflection_map, max_depth=4, program_id=program_id)
+        while node.is_terminal or not node.children:
+            # Caso caia no limite de profundidade e re-selecione, o tempo conta para expansão
+            node = select_node(root, program_id)
+            expand_node(node, args, task, env, failed_trajectories, reflection_map, program_id, step_stats)
+        step_stats["expansion_time_s"] += time.time() - t0
 
+        # Medindo Evaluation
+        t0 = time.time()
+        value = evaluate_node(node, args, task, failed_trajectories, reflection_map, program_id, step_stats)
+        step_stats["evaluation_time_s"] += time.time() - t0
+        
+        # Medindo Rollout
+        t0 = time.time()
+        reward, terminal_node = rollout(max(node.children, key=lambda child: child.value), args, task, idx, env, failed_trajectories, reflection_map, max_depth=4, program_id=program_id, step_stats=step_stats)
         terminal_nodes.append(terminal_node)
+        step_stats["rollout_time_s"] += time.time() - t0
 
         if terminal_node.reward == 1:
-            logging.info(f"[{program_id}] SUCCESSFUL TRAJECTORY FOUND DURING SIMULATION")
             time_info = get_search_stats(env)
+            time_info.update(step_stats)
+            time_info["iterations_used"] = iterations_used
+            notify_program_completion(program_id, idx, status="success_rollout", time_info=time_info)
             return terminal_node.state, terminal_node.value, [terminal_node], terminal_node.reward, terminal_node.em, time_info
 
+        # Medindo Backpropagation
+        t0 = time.time()
         backpropagate(terminal_node, reward, program_id)
+        step_stats["backprop_time_s"] += time.time() - t0
         all_nodes = [(node, node.value) for node in collect_all_nodes(root)]
 
         # Check for terminal nodes with a reward of 1
@@ -252,6 +315,8 @@ def lats_search(args, task, idx, iterations=30, to_print=True, program_id="defau
             logging.info(f"[{program_id}] Terminal node with reward 1 found at iteration {i + 1}")
             best_node = max(terminal_nodes_with_reward_1, key=lambda x: x.value)
             time_info = get_search_stats(env)
+            time_info["iterations_used"] = iterations_used
+            notify_program_completion(program_id, idx, status="success_tree_search", time_info=time_info)
             return best_node.state, best_node.value, all_nodes if all_nodes else [best_node], best_node.reward, best_node.em, time_info
     
         for j, (n, v) in enumerate(all_nodes):
@@ -271,6 +336,10 @@ def lats_search(args, task, idx, iterations=30, to_print=True, program_id="defau
     if best_child is None:
         best_child = root
     time_info = get_search_stats(env)
+    time_info.update(step_stats)
+    time_info["iterations_used"] = iterations_used
+    status_final = "finished_success" if best_child and best_child.reward == 1 else "finished_max_iterations"
+    notify_program_completion(program_id, idx, status=status_final, time_info=time_info)
     return best_child.state, best_child.value, all_nodes_list, best_child.reward, best_child.em, time_info
 
 def select_node(node, program_id="default_prog"):
@@ -302,30 +371,33 @@ def select_node(node, program_id="default_prog"):
         
     return node  # This will return None if all paths from the root are exhausted
 
-def expand_node(node, args, task, env, failed_trajectories, reflection_map, program_id="default_prog"):
+def expand_node(node, args, task, env, failed_trajectories, reflection_map, program_id="default_prog", step_stats=None):
     # print("LIMITE PROFUNDIADE:",args.depth_limit)
     if node.depth >= args.depth_limit:
         logging.info(f"[{program_id}] Depth limit reached")
         print(f"[{program_id}] Depth limit reached")
         node.is_terminal = True
         return
-    new_nodes = generate_new_states(node, args, task, args.n_generate_sample, env, failed_trajectories, reflection_map, program_id)
+    new_nodes = generate_new_states(node, args, task, args.n_generate_sample, env, failed_trajectories, reflection_map, program_id, step_stats=step_stats, phase="expansion")
     node.children.extend(new_nodes)
 
-def rollout(node, args, task, idx, env, failed_trajectories, reflection_map, max_depth=4, program_id="default_prog"):
+def rollout(node, args, task, idx, env, failed_trajectories, reflection_map, max_depth=4, program_id="default_prog", step_stats=None):
     logging.info(f"[{program_id}] ROLLING OUT")
     depth = node.depth
     # print(f"[{program_id}] 4) SIMULATION: Fazendo rollout a partir da profundidade {depth}...")
 
-    n = 5
+    n = args.n_rollout
     rewards = [0]
     while not node.is_terminal and depth < max_depth:
-        # Generate new states
+        if getattr(args, 'kill_event', None) and args.kill_event.is_set():
+            logging.info(f"[{program_id}] Kill event detected! Stopping rollout.")
+            raise InterruptedError("Hard stopped by orchestrator timeout")
         logging.info(f"[{program_id}] ROLLING OUT {depth}")
         new_states = []
         values = []
         while len(new_states) == 0:
-            new_states = generate_new_states(node, args, task, n, env, failed_trajectories, reflection_map, program_id)
+            # Usa phase="rollout"
+            new_states = generate_new_states(node, args, task, n, env, failed_trajectories, reflection_map, program_id, step_stats=step_stats, phase="rollout")
 
         for state in new_states:
             if state.is_terminal:
@@ -333,7 +405,8 @@ def rollout(node, args, task, idx, env, failed_trajectories, reflection_map, max
                 
         child_prompts = [generate_prompt(child) for child in new_states if not child.is_terminal and child is not None]
         while len(values) == 0:
-            values = get_values(task, node.question, child_prompts, args.n_evaluate_sample, failed_trajectories, reflection_map, program_id=program_id)
+            # Usa phase="rollout"
+            values = get_values(task, node.question, child_prompts, args.n_evaluate_sample, failed_trajectories, reflection_map, program_id=program_id, step_stats=step_stats, phase="rollout")
             
         max_value_index = values.index(max(values))
         rewards.append(max(values))
@@ -345,10 +418,10 @@ def rollout(node, args, task, idx, env, failed_trajectories, reflection_map, max
     logging.info(f"[{program_id}] ROLLOUT FINISHED")
     return sum(rewards) / len(rewards), node
 
-def generate_new_states(node, args, task, n, env, failed_trajectories, reflection_map, program_id="default_prog"):
+def generate_new_states(node, args, task, n, env, failed_trajectories, reflection_map, program_id="default_prog", step_stats=None, phase="expansion"):
     # print(f"[{program_id}] 2) EXPANSION: Gerando {n} novas ações...")
     prompt = generate_prompt(node)
-    sampled_actions = get_samples(task, prompt, f"Thought {node.depth + 1}: ", n, prompt_sample=args.prompt_sample, stop="Observation", failed_trajectories=failed_trajectories, reflection_map=reflection_map, program_id=program_id)
+    sampled_actions = get_samples(task, prompt, f"Thought {node.depth + 1}: ", n, prompt_sample=args.prompt_sample, stop="Observation", failed_trajectories=failed_trajectories, reflection_map=reflection_map, program_id=program_id, step_stats=step_stats, phase=phase)
     logging.info(f"[{program_id}] SAMPLED ACTION: {sampled_actions}")
     
     # print(f"\n[{program_id}] TEXTO GERADO PELO LLAMA 3.1:\n{sampled_actions}\n")
@@ -403,11 +476,10 @@ def generate_new_states(node, args, task, n, env, failed_trajectories, reflectio
     return list(unique_states.values())  # Return unique nodes as a list
 
 
-def evaluate_node(node, args, task, failed_trajectories, reflection_map, program_id="default_prog"):
+def evaluate_node(node, args, task, failed_trajectories, reflection_map, program_id="default_prog", step_stats=None):
     # print(f"[{program_id}] 3) EVALUATION: Avaliando {len(node.children)} nós filhos...")
     child_prompts = [generate_prompt(child) for child in node.children if not child.is_terminal]
-    votes = get_values(task, node.question, child_prompts, args.n_evaluate_sample, failed_trajectories, reflection_map, program_id=program_id)
-    
+    votes = get_values(task, node.question, child_prompts, args.n_evaluate_sample, failed_trajectories, reflection_map, program_id=program_id, step_stats=step_stats, phase="expansion")    
     logging.info(f"[{program_id}] Length of votes: {len(votes)}")
     logging.info(f"[{program_id}] Length of node.children: {len(node.children)}")
     

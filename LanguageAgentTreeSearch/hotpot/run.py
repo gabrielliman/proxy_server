@@ -34,6 +34,11 @@ def _tpot_list(reqs) -> List[float]:
             tpot_list.append((r.latency)/ (r.output_tokens - 1))
     return tpot_list
 
+
+def max_request_token_count(reqs) -> int:
+    return max((r.input_tokens + r.output_tokens) for r in reqs) if reqs else 0
+
+
 def summarize_program(prog: ProgramMetrics) -> Dict[str, Any]:
     if not prog.requests:
         return {"program_id": prog.program_id, "num_requests": 0}
@@ -41,6 +46,7 @@ def summarize_program(prog: ProgramMetrics) -> Dict[str, Any]:
     latencies = [r.latency for r in prog.requests if r.latency > 0]    #latencia de uma requisicao é o tempo desde que foi enviada para o escalonador ate receber resposta
     output_tokens = [r.output_tokens for r in prog.requests]
     input_tokens = [r.input_tokens for r in prog.requests]
+    max_request_tokens = max_request_token_count(prog.requests)
     start = min(r.start_time for r in prog.requests)
     end = max(r.end_time for r in prog.requests)
     full_time = float(end - start)
@@ -50,7 +56,7 @@ def summarize_program(prog: ProgramMetrics) -> Dict[str, Any]:
     total_tokens = total_input_tokens + total_output_tokens
     waiting_time = prog.waiting_time
     service_time = prog.service_time
-
+    
     tpots = _tpot_list(prog.requests)
 
     return {
@@ -61,6 +67,7 @@ def summarize_program(prog: ProgramMetrics) -> Dict[str, Any]:
         "num_requests": len(prog.requests),
         "total_input_tokens": total_input_tokens,
         "total_output_tokens": total_output_tokens,
+        "max_request_tokens": max_request_tokens,
         "prog_ttft_s": prog_ttfts if prog_ttfts else None,
         "waiting_time_s": waiting_time,
         "service_time_s": service_time,
@@ -353,6 +360,7 @@ async def run_async_orchestrator(args):
     total_wall = time.perf_counter() - start_time
     program_max_depths = {}
     program_wiki_stats = {}
+    program_lats_times = {}
     tree_dumped = True
     for prog_id, idx, em, reward, all_nodes, time_info in results:
         program_wiki_stats[prog_id] = {
@@ -361,7 +369,21 @@ async def run_async_orchestrator(args):
             "call_speed": time_info.get("call_speed", 0),
             "cache_hits": time_info.get("cache_hits", None),
             "cache_misses": time_info.get("cache_misses", None),
-            "lats_critical_path_time": time_info.get("lats_critical_path_time", 0.0) # <--- NOVA LINHA
+            "lats_critical_path_time": time_info.get("lats_critical_path_time", 0.0)
+            }
+        
+        # Extrai os tempos de LATS + requisições
+        program_lats_times[prog_id] = {
+            "selection_time_s": time_info.get("selection_time_s", 0.0),
+            "expansion_time_s": time_info.get("expansion_time_s", 0.0),
+            "evaluation_time_s": time_info.get("evaluation_time_s", 0.0),
+            "rollout_time_s": time_info.get("rollout_time_s", 0.0),
+            "backprop_time_s": time_info.get("backprop_time_s", 0.0),
+            "start_expansion_requests": time_info.get("start_expansion_requests", 0),
+            "start_evaluation_requests": time_info.get("start_evaluation_requests", 0),
+            "rollout_expansion_requests": time_info.get("rollout_expansion_requests", 0),
+            "rollout_evaluation_requests": time_info.get("rollout_evaluation_requests", 0),
+            "iterations_used": time_info.get("iterations_used", 0),
         }
         if all_nodes:
             # Pega a lista de nós limpa (lidando com tuplas se houver)
@@ -470,7 +492,7 @@ async def run_async_orchestrator(args):
         full_prog, percentiles=[50, 75, 90, 95, 99],
         path=args.output_json, is_baseline=args.is_baseline_run
     )
-
+    max_in_flight_global, max_in_flight_program = models.get_in_flight_stats()
     for p in per_program_metrics:
         p["max_depth_reached"] = program_max_depths.get(p["program_id"], 0)
         
@@ -480,9 +502,12 @@ async def run_async_orchestrator(args):
         p["wiki_call_speed"] = stats.get("call_speed", 0)
         p["wiki_cache_hits"] = stats.get("cache_hits", None)
         p["wiki_cache_misses"] = stats.get("cache_misses", None)
-        p["lats_critical_path_time_s"] = stats.get("lats_critical_path_time", 0.0) # <--- NOVA LINHA
+        p["lats_critical_path_time_s"] = stats.get("lats_critical_path_time", 0.0)
+        p["iterations_used"] = stats.get("iterations_used", 0.0)
+        lats_stats = program_lats_times.get(p["program_id"], {})
+        p.update(lats_stats)
+        p["max_in_flight_requests"] = max_in_flight_program.get(p["program_id"], 0)
 
-    # --- OPCIONAL: Adicionar médias de profundidade nas métricas gerais (full_metrics) ---
     if program_max_depths:
         depths_array = list(program_max_depths.values())
         full_metrics["mean_max_depth"] = float(np.mean(depths_array))
@@ -554,6 +579,20 @@ async def run_async_orchestrator(args):
     full_metrics["num_programs"] = len(program_results)
     full_metrics["total_requests"] = len(all_requests)
 
+    full_metrics["max_in_flight_requests_global"] = max_in_flight_global
+    full_metrics["total_start_expansion_requests"] = sum(p.get("start_expansion_requests", 0) for p in per_program_metrics)
+    full_metrics["total_start_evaluation_requests"] = sum(p.get("start_evaluation_requests", 0) for p in per_program_metrics)
+    full_metrics["total_rollout_expansion_requests"] = sum(p.get("rollout_expansion_requests", 0) for p in per_program_metrics)
+    full_metrics["total_rollout_evaluation_requests"] = sum(p.get("rollout_evaluation_requests", 0) for p in per_program_metrics)
+    
+    # Se quiser manter o total geral também:
+    full_metrics["total_all_expansion_requests"] = full_metrics["total_start_expansion_requests"] + full_metrics["total_rollout_expansion_requests"]
+    full_metrics["total_all_evaluation_requests"] = full_metrics["total_start_evaluation_requests"] + full_metrics["total_rollout_evaluation_requests"]
+
+    full_metrics["total_processado"] = len(results)
+    full_metrics["media_exact_match_em"] = cnt_avg
+    full_metrics["tempo_total_orquestrador_s"] = total_wall
+    full_metrics["usage_so_far"] = gpt_usage(args.backend)  
     # Validação do Rate Limiter
     def analyze_request_rate(send_times):
         if len(send_times) < 2: return {}
@@ -614,7 +653,7 @@ def parse_args():
     args.add_argument('--task_start_index', type=int, default=900)
     args.add_argument('--task_end_index', type=int, default=1000)
     args.add_argument('--prompt_sample', type=str, choices=['standard', 'cot'], default='standard')
-    args.add_argument('--n_generate_sample', type=int, default=1)  
+    args.add_argument('--n_generate_sample', type=int, default=5)  
     args.add_argument('--n_evaluate_sample', type=int, default=1)
     args.add_argument('--iterations', type=int, default=50)
     args.add_argument('--log', type=str, default='logs/lats_test.log')
@@ -629,6 +668,7 @@ def parse_args():
 
     #limite profundidade
     args.add_argument('--depth_limit', type=int, default=7, help='Limite de profundidade para a busca (apenas para LATS)')
+    args.add_argument('--n_rollout', type=int, default=5)  
 
     parsed = args.parse_args()
     parsed.is_baseline_run = bool(parsed.is_baseline_run)

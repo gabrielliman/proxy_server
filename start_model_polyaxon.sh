@@ -13,7 +13,7 @@ START_PORT=8105        # The starting port number
 GPU=0 #starting gpu
 ENGINE_IDX=1 
 PER_GPU=1
-GPU_PERCENT=0.125
+GPU_PERCENT=0.16
 
 source /opt/conda/etc/profile.d/conda.sh && conda activate proxy_server
 set -x
@@ -76,7 +76,7 @@ for PORT in "${PORTS[@]}"; do
         --port "$PORT" \
         --max-num-seqs "$MAX_NUM_SEQS" \
         --dtype bfloat16 \
-        --max-model-len 9000 \
+        --max-model-len 5000 \
         --gpu-memory-utilization $GPU_PERCENT \
         --served-model-name $MODEL_NAME \
         > >(tee "$LOG_DIR/saida_VLLM_${PORT}.txt") 2>&1 &

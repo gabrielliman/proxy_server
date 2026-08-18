@@ -73,13 +73,25 @@ def tokens_in_text(text):
         tokens = tokenizer.encode(text, add_special_tokens=False)
     return len(tokens)
 
+# Novos controladores de requisições em voo (in-flight)
+_in_flight_lock = threading.Lock()
+in_flight_global = 0
+max_in_flight_global = 0
+in_flight_program = defaultdict(int)
+max_in_flight_program = defaultdict(int)
+
+def get_in_flight_stats():
+    """Retorna as estatísticas de concorrência para o orquestrador salvar no JSON"""
+    with _in_flight_lock:
+        return max_in_flight_global, dict(max_in_flight_program)
+
 # ==============================================================================
 # Configurações da sua API Customizada
 # ==============================================================================
 API_BASE = os.getenv("CUSTOM_API_BASE", "http://localhost:8000")
 DEFAULT_MODEL = os.getenv("CUSTOM_MODEL", "seu-modelo-aqui")
 
-def gpt(prompt, model=None, temperature=1.0, max_tokens=2048, n=1, stop=None, program_id="default_prog") -> list:
+def gpt(prompt, model=None, temperature=1.0, max_tokens=100, n=1, stop=None, program_id="default_prog") -> list:
     """
     Wrapper para prompts em texto simples. Adicionado o parâmetro program_id.
     """
@@ -101,12 +113,22 @@ def gpt(prompt, model=None, temperature=1.0, max_tokens=2048, n=1, stop=None, pr
 def _single_request(url, payload, program_id):
     """
     Função auxiliar para executar uma única requisição HTTP.
-    Agora rastreia E2EL, TTFT, TPOT, ITL e salva no registry.
+    Agora rastreia E2EL, TTFT, TPOT, ITL, in-flight requests e salva no registry.
     """
-    # Estima os tokens de input baseando-se nas mensagens enviadas
+    global in_flight_global, max_in_flight_global
+    
+    # 1. Incrementa contadores de requisições em voo ANTES de enviar
+    with _in_flight_lock:
+        in_flight_global += 1
+        if in_flight_global > max_in_flight_global:
+            max_in_flight_global = in_flight_global
+            
+        in_flight_program[program_id] += 1
+        if in_flight_program[program_id] > max_in_flight_program[program_id]:
+            max_in_flight_program[program_id] = in_flight_program[program_id]
+
     input_text = "\n".join([m.get("content", "") for m in payload.get("messages", [])])
     input_tokens = tokens_in_text(input_text)
-    
     start_time = time.perf_counter()
     
     try:
@@ -118,12 +140,11 @@ def _single_request(url, payload, program_id):
         content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
         usage = result.get("usage", {})
         
-        # Lógica de cálculo de tempo e output tokens
         latency = end_time - start_time
         output_tokens = tokens_in_text(content) if content else 0
         
         if output_tokens > 0:
-            ttft = 0.001 # Aproximação para APIs sem streaming
+            ttft = 0.001 
             if output_tokens > 1:
                 per_token = (latency - ttft) / (output_tokens - 1)
                 itl = [per_token] * (output_tokens - 1)
@@ -134,16 +155,11 @@ def _single_request(url, payload, program_id):
             itl = []
             
         rm = RequestMetrics(
-            ttft=ttft,
-            latency=latency,
-            itl=itl,
-            output_tokens=output_tokens,
-            input_tokens=input_tokens,
-            start_time=start_time,
-            end_time=end_time
+            ttft=ttft, latency=latency, itl=itl,
+            output_tokens=output_tokens, input_tokens=input_tokens,
+            start_time=start_time, end_time=end_time
         )
         
-        # Salva as métricas silenciosamente
         with _metrics_lock:
             PROGRAM_METRICS_REGISTRY[program_id].append(rm)
             
@@ -156,8 +172,14 @@ def _single_request(url, payload, program_id):
         with _metrics_lock:
             PROGRAM_METRICS_REGISTRY[program_id].append(rm)
         return "", {}
+        
+    finally:
+        # 2. Decrementa contadores APÓS a requisição finalizar
+        with _in_flight_lock:
+            in_flight_global -= 1
+            in_flight_program[program_id] -= 1
 
-def chatgpt(messages, model=None, temperature=1.0, max_tokens=2048, n=1, stop=None, program_id="default_prog") -> list:
+def chatgpt(messages, model=None, temperature=1.0, max_tokens=100, n=1, stop=None, program_id="default_prog") -> list:
     """
     Faz 'n' requisições HTTP síncronas em paralelo para a API customizada usando Threads.
     """
@@ -178,7 +200,8 @@ def chatgpt(messages, model=None, temperature=1.0, max_tokens=2048, n=1, stop=No
         payload["stop"] = stop if isinstance(stop, list) else [stop]
 
     outputs = []
-    max_workers = min(n, 50) 
+    max_workers = n 
+    # max_workers = min(n, 50) #havia um limite de 50 requests enviadas em paralelo por programa 
     
     # Registra o tempo de "envio" das requisições para a validação do Rate Limiter Global
     with _send_time_lock:

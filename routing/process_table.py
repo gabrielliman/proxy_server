@@ -8,14 +8,31 @@ class ProcessTable:
     def __init__(self):
         self.lock = Lock()
         self.table: Dict[str, Dict[str, Any]] = {}
-        
+        self.accepting_requests=True
+
+    def is_program_active(self, program_id: str) -> bool:
+        """Verifica se o programa possui threads ativas (evita barrar no meio do caminho)."""
+        with self.lock:
+            entry = self.table.get(program_id)
+            if not entry:
+                return False
+                
+            # Se tem alguma thread 'waiting' ou 'running', o programa já está no sistema
+            for th in entry.get("threads", {}).values():
+                if th.get("state") in ("running", "completed"):
+                    return True
+            return False
+           
     def ensure_process(self, program_id: str):
         with self.lock:
             if program_id not in self.table:
                 self.table[program_id] = {
                     "service_time_cumulative": 0.0,
+                    "service_time_cumulative_total": 0.0,
                     "service_time_max": 0.0,
                     "waiting_time_cumulative": 0.0,
+                    "waiting_time_cumulative_total": 0.0,
+                    "waiting_time_max": 0.0,
                     "call_count": 0,
 
                     # KV token-time metric (d*c = pd + d²/2)
@@ -132,7 +149,10 @@ class ProcessTable:
                 th["engine_id"] = engine_id
 
             entry["waiting_time_cumulative"] += th["waiting_time"]
+            entry["waiting_time_cumulative_total"] += th["waiting_time"]
 
+            if th["waiting_time"] > entry.get("waiting_time_max", 0.0):
+                entry["waiting_time_max"] = th["waiting_time"]
             if engine_id:
                 entry["engine_ids"].add(engine_id)
                 
@@ -205,6 +225,7 @@ class ProcessTable:
             th["state"] = "completed"
 
             entry["service_time_cumulative"] += service
+            entry["service_time_cumulative_total"] += service
             if service > entry["service_time_max"]:
                 entry["service_time_max"] = service
 
@@ -251,9 +272,12 @@ class ProcessTable:
             engine_ids_copy = list(entry.get("engine_ids", []))
             result = {
                 "service_time_cumulative": entry["service_time_cumulative"],
+                "service_time_cumulative_total": entry["service_time_cumulative_total"],
                 "service_time_max": entry["service_time_max"],
                 "call_count": entry.get("call_count", 0),
                 "waiting_time_cumulative": entry["waiting_time_cumulative"],
+                "waiting_time_cumulative_total": entry["waiting_time_cumulative_total"],
+                "waiting_time_max": entry.get("waiting_time_max", 0.0),
                 "preferred_engines": entry.get("preferred_engines", []),
                 "engine_ids": engine_ids_copy,
                 "engine_request_counts": dict(entry.get("engine_request_counts", {})),
@@ -280,8 +304,11 @@ class ProcessTable:
 
             snapshot[pid] = {
                 "service_time_cumulative": entry.get("service_time_cumulative", 0.0),
+                "service_time_cumulative_total": entry.get("service_time_cumulative_total", 0.0),
                 "service_time_max": entry.get("service_time_max", 0.0),
                 "waiting_time_cumulative": entry.get("waiting_time_cumulative", 0.0),
+                "waiting_time_cumulative_total": entry.get("waiting_time_cumulative_total", 0.0),
+                "waiting_time_max": entry.get("waiting_time_max", 0.0),
                 "call_count": entry.get("call_count", 0.0),
                 "kv_token_time_cumulative": entry.get("kv_token_time_cumulative", 0.0),
                 "longest_critical_path": entry.get("longest_critical_path", 0.0),
@@ -309,8 +336,11 @@ class ProcessTable:
 
             snapshot[pid] = {
                 "service_time_cumulative": entry.get("service_time_cumulative", 0.0),
+                "service_time_cumulative_total": entry.get("service_time_cumulative_total", 0.0),
                 "service_time_max": entry.get("service_time_max", 0.0),
                 "waiting_time_cumulative": entry.get("waiting_time_cumulative", 0.0),
+                "waiting_time_cumulative_total": entry.get("waiting_time_cumulative_total", 0.0),
+                "waiting_time_max": entry.get("waiting_time_max", 0.0),
                 "call_count": entry.get("call_count", 0.0),
                 "kv_token_time_cumulative": entry.get("kv_token_time_cumulative", 0.0),
                 "longest_critical_path": entry.get("longest_critical_path", 0.0),
@@ -330,7 +360,7 @@ class ProcessTable:
             entry = self.table.get(program_id)
             if not entry:
                 return None
-            return entry.get("waiting_time_cumulative", 0.0)
+            return entry.get("waiting_time_cumulative_total", 0.0)
     
     def get_service_time(self, program_id: str) -> Optional[float]:
         """Return total service time for a program, or None if not found."""
@@ -338,7 +368,7 @@ class ProcessTable:
             entry = self.table.get(program_id)
             if not entry:
                 return None
-            return entry.get("service_time_cumulative", 0.0)
+            return entry.get("service_time_cumulative_total", 0.0)
 
     def get_incomplete_requests_count(self) -> int:
         """Retorna o número total de requisições (threads) que ainda não foram concluídas."""
@@ -486,5 +516,35 @@ class ProcessTable:
                         counts[engine_id] = counts.get(engine_id, 0) + 1
         return counts
 
+    def purge_waiting_and_stale(self) -> Dict[str, Any]:
+        """Remove todas as requisições 'waiting' e apaga programas que ficaram sem requisições ativas/concluídas."""
+        removed_threads_count = 0
+        removed_programs = []
+        
+        with self.lock:
+            for pid, entry in list(self.table.items()):
+                threads = entry.get("threads", {})
+                
+                # Identifica e remove threads em estado de espera
+                waiting_tids = [tid for tid, th in threads.items() if th.get("state") == "waiting"]
+                for tid in waiting_tids:
+                    del threads[tid]
+                    removed_threads_count += 1
+                
+                # Verifica se restou alguma thread ativa ou concluída no programa
+                has_active_or_completed = any(
+                    th.get("state") in ("waiting", "running", "completed") 
+                    for th in threads.values()
+                )
+                
+                # Se não há mais requisições, remove o programa da tabela
+                if not has_active_or_completed:
+                    del self.table[pid]
+                    removed_programs.append(pid)
+                    
+        return {
+            "removed_threads": removed_threads_count,
+            "removed_programs": removed_programs
+        }
 # Module singleton
 PROCESS_TABLE = ProcessTable()

@@ -5,6 +5,61 @@ conda activate /mnt/scratch/scheduler/envs/proxy_server
 set -x
 
 
+
+#Model Parameters
+MODEL_NAME="meta-llama/Llama-3.1-8B-Instruct"
+MODEL_PATH="meta-llama/Llama-3.1-8B-Instruct"
+MAX_NUM_SEQS=192
+LOG_DIR="./var/logs"
+
+# Number of instances parameters
+NUM_INSTANCES=1       # Change this to the number of ports you want
+START_PORT=8106       # The starting port number
+PARALLELISM_VALUE=10000   # The parallelism value for all ports # changed for waiting to have effect
+GPU=0 #starting gpu
+ENGINE_IDX=1  # Counter to create PID1, PID2, etc.
+PER_GPU=1
+GPU_PERCENT=0.97
+MAX_MODEL_LEN=40000 #40000
+
+# Lats parameters
+export PROXY_PORT=8081
+BASE_URL="http://localhost:${PROXY_PORT}" #proxy server url
+
+export ENABLE_ADMISSION_CONTROL="True"  # Altere para "False" para desligar
+export ADMISSION_WINDOW_S="10.0"        # Janela da média móvel em segundos
+export AIMD_LOG_CSV="./var/logs/aimd_decisions.csv"
+
+
+MODEL="$MODEL_NAME"
+LIMIT=500
+OUTPUTS_DIR="outputs/sharegpt"
+mkdir -p "$OUTPUTS_DIR"
+CHAT_LEN=-10
+REPEATS=1
+RATES=("8")
+# RATES=("0.5" "1" "2" "4" "8")
+BURSTINESS=1
+
+# Format: "scheduler_name:plas_metric_type"
+SCHEDULER_CONFIGS=(
+  "fcfs:N/A"
+#   "plas:service_cumulative"
+#   "plas:kv_token_time"
+) 
+
+# Format: "strategy_name:threshold_metric:threshold_value"
+LB_CONFIGS=(
+#   "least-total-load:N/A:0"
+#   "least-waiting:N/A:0"
+#   "least-running:N/A:0"
+#   "least-kv-cache:N/A:0"
+#   "autellix:N/A:0"
+#   "threshold-autellix:total:15"
+#   "threshold-autellix:running:10"
+#   "threshold-autellix:kv_cache_percent:90"
+)
+
 # ## arruma um dos warning, mas nao entendi direito
 FLASHINFER_DIR="/opt/conda/envs/proxy_server/lib/python3.12/site-packages/flashinfer/data/include/flashinfer/comm"
 
@@ -24,17 +79,37 @@ done
 # Global Configuration
 # ============================================================
 rm ./kv_cache_usage.csv 2>/dev/null || true
-# Set the model name once
-MODEL_NAME="meta-llama/Llama-3.1-8B-Instruct"
-MODEL_PATH="meta-llama/Llama-3.1-8B-Instruct"
-
 
 # Define the ports as an array. Add or remove ports here to automatically scale.
-PORTS=(8105 8106)
+export MODEL="$MODEL_NAME"
 
-# Shared parameters
-MAX_NUM_SEQS=10
-LOG_DIR="./var/logs"
+# Initialize empty arrays
+PORTS=()
+ROUTES_LIST=()
+PARALLELISM_LIST=()
+
+# Loop to generate the ports and JSON elements
+for (( i=0; i<NUM_INSTANCES; i++ )); do
+  PORT=$((START_PORT + i))
+  PORTS+=("$PORT")
+  ROUTES_LIST+=("\"http://localhost:$PORT\"")
+  PARALLELISM_LIST+=("\"http://localhost:$PORT\": $PARALLELISM_VALUE")
+done
+
+# Join the arrays with commas
+ROUTES_JOINED=$(IFS=,; echo "${ROUTES_LIST[*]}")
+PARALLELISM_JOINED=$(IFS=,; echo "${PARALLELISM_LIST[*]}")
+
+# Construct and export the final JSON strings
+export MODEL_ROUTES="{
+  \"$MODEL_NAME\": [
+    $ROUTES_JOINED
+  ]
+}"
+
+export BACKEND_PARALLELISM="{
+  $PARALLELISM_JOINED
+}"
 
 # ============================================================
 # Setup & Helper Functions
@@ -56,40 +131,40 @@ wait_for_ready() {
 export VLLM_SERVER_DEV_MODE=1
 echo "[INFO] Starting vLLM inference servers"
 
-# Loop through the PORTS array and start a server for each
-GPU=0
-ENGINE_IDX=1  # Counter to create PID1, PID2, etc.
+VLLM_PIDS=()
+cleanup_engines() {
+    echo "[CLEANUP] Automatically terminating vLLM engines..."
+    if [ ${#VLLM_PIDS[@]} -gt 0 ]; then
+        kill "${VLLM_PIDS[@]}" 2>/dev/null || true
+    fi
+}
+# Trap normal exits (0), Ctrl+C (2), and error exits (15)
+trap cleanup_engines EXIT INT TERM
 
+# Loop through the PORTS array and start a server for each
 for PORT in "${PORTS[@]}"; do
     echo "[INFO] Booting server on port $PORT..."
     
-    # Your exact pipeline syntax
     CUDA_VISIBLE_DEVICES=$GPU python -u -m vllm.entrypoints.openai.api_server \
         --model "$MODEL_PATH" \
         --port "$PORT" \
         --max-num-seqs "$MAX_NUM_SEQS" \
         --dtype bfloat16 \
-        --max-model-len 40000 \
-        --gpu-memory-utilization 0.9 \
+        --max-model-len $MAX_MODEL_LEN \
+        --gpu-memory-utilization $GPU_PERCENT \
         --served-model-name $MODEL_NAME \
-        2>&1 | tee "$LOG_DIR/saida_VLLM_${PORT}.txt" & 
+        > >(tee "$LOG_DIR/saida_VLLM_${PORT}.txt") 2>&1 &
         
-    # This executes exactly as: PID1=$!, PID2=$!, etc.
-    eval "PID${ENGINE_IDX}=\$!"
-    
-    # Print verification showing the variable name and value
+    VLLM_PIDS+=($!)
     eval "echo '[INFO] Engine $PORT assigned to PID${ENGINE_IDX}=\$PID${ENGINE_IDX}'"
         
     wait_for_ready "$PORT"
-    GPU=$((GPU + 1))
-
+    if (( ENGINE_IDX % $PER_GPU == 0 )); then
+        GPU=$((GPU + 1))
+    fi
     ENGINE_IDX=$((ENGINE_IDX + 1))
 done
-# ============================================================
-# Benchmark Setup
-# ============================================================
-BASE_URL="http://localhost:8081"
-#trocar para local na scratch
+
 DATASET="/mnt/scratch/global/datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
 
 # if [ ! -f "$DATASET" ]; then
@@ -111,34 +186,7 @@ done
 # ============================================================
 # Experiment grid
 # ============================================================
-MODEL="$MODEL_NAME"
-LIMIT=10
-OUTPUTS_DIR="outputs/teste3"
-mkdir -p "$OUTPUTS_DIR"
-CHAT_LEN=-10
-REPEATS=1
-RATES=("8")
-# RATES=("0.5" "1" "2" "4" "8")
-BURSTINESS=1
 
-# Format: "scheduler_name:plas_metric_type"
-SCHEDULER_CONFIGS=(
-  "fcfs:N/A"
-#   "plas:service_cumulative"
-#   "plas:kv_token_time"
-) 
-
-# Format: "strategy_name:threshold_metric:threshold_value"
-LB_CONFIGS=(
-  "least-total-load:N/A:0"
-#   "least-waiting:N/A:0"
-#   "least-running:N/A:0"
-#   "least-kv-cache:N/A:0"
-#   "autellix:N/A:0"
-#   "threshold-autellix:total:15"
-#   "threshold-autellix:running:10"
-#   "threshold-autellix:kv_cache_percent:90"
-)
 
 # ============================================================
 # Helper: scrape per-engine metrics

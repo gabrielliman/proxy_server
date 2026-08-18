@@ -1,6 +1,9 @@
 # routing/dispatcher/workers.py
 
 import asyncio
+import os
+import time
+import csv
 import httpx
 import time
 from routing.dispatcher.base import BaseDispatcher
@@ -10,6 +13,7 @@ from utils.tokenizer_utils import get_tokenizer
 from routing.load_balancer import LOAD_BALANCER
 from fastapi import HTTPException
 
+_logged_admissions = set()
 class WorkerPoolDispatcher(BaseDispatcher):
     workers_started = False
     shared_client = None
@@ -60,6 +64,7 @@ class WorkerPoolDispatcher(BaseDispatcher):
 
     async def worker_loop(self, queue_name, queue, worker_id, client):
         from routing.process_table import PROCESS_TABLE
+        import config.settings as settings
 
         while True:
             # Puxa da Fila Global
@@ -73,6 +78,38 @@ class WorkerPoolDispatcher(BaseDispatcher):
             pid = item.get("program_id")
             cid = item.get("call_id")
             input_tokens = item.get("input_tokens", 0) 
+
+            # --- NOVO: DOUBLE-CHECK DE ADMISSÃO (SOFT EVICTION PAUSE) ---
+            if getattr(settings, 'ENABLE_ADMISSION_CONTROL', False) and pid:
+                # Verifica rapidamente se o programa ainda está na festa
+                with LOAD_BALANCER.aimd_lock:
+                    is_admitted = pid in LOAD_BALANCER.admitted_programs
+                
+                if not is_admitted:
+                    # O programa foi expulso enquanto essa requisição estava na fila!
+                    # Vamos manter no proxy: Suspende em background esperando readmissão.
+                    async def defer_request(deferred_item, deferred_pid):
+                        # Fica travado aqui sem gastar CPU até a vaga voltar
+                        await LOAD_BALANCER.wait_for_admission(deferred_pid)
+                        
+                        # Quando a vaga voltar, devolve para a fila de execução
+                        if SCHEDULER in ("plas", "atlas"):
+                            if SCHEDULER == "atlas":
+                                from routing.scheduler_atlas import compute_priority
+                            else:
+                                from routing.scheduler_plas import compute_priority
+                            priority, _ = compute_priority(deferred_pid, deferred_item.get("call_id"))
+                            await put_request(queue_name, priority, deferred_item)
+                        else:
+                            await queue.put(deferred_item)
+                            
+                    # Cria a rotina de espera e libera o worker imediatamente
+                    asyncio.create_task(defer_request(item, pid))
+                    
+                    if hasattr(queue, "task_done") and SCHEDULER not in ("plas", "atlas"):
+                        queue.task_done()
+                    continue # Pula para a próxima requisição de um programa válido
+            # -------------------------------------------------------------
 
             if pid and cid:
                 PROCESS_TABLE.record_dequeue(pid, cid)
@@ -165,8 +202,39 @@ class WorkerPoolDispatcher(BaseDispatcher):
     # Mantivemos 'backend' na assinatura para não quebrar quem chama o dispatch (ex: o servidor principal)
     async def dispatch(self, backend: str, data: dict, program_id: str = None, call_id: str = None, input_tokens: int = 0) -> dict:
         from routing.process_table import PROCESS_TABLE
+        import config.settings as settings
+        
+        if getattr(PROCESS_TABLE, 'accepting_requests', True) is False:
+            raise HTTPException(
+                status_code=503, 
+                detail="Proxy is shutting down and no longer accepting new vLLM requests."
+            )
+            
+        arrival_time = time.time()
         await self.start_workers()
+        enable_admission = getattr(settings, 'ENABLE_ADMISSION_CONTROL', False)
+        
+        # --- NOVO: Substituição para o Controle de Portão do AIMD por Programa ---
+        if enable_admission and program_id:
+            await LOAD_BALANCER.wait_for_admission(program_id)
 
+        # Log CSV mantido idêntico...
+        if program_id not in _logged_admissions:
+            _logged_admissions.add(program_id)
+            admit_time = time.time()
+            wait_duration = admit_time - arrival_time
+            
+            csv_path = "admission_log.csv"
+            file_exists = os.path.exists(csv_path)
+            
+            # Escreve os dados no final do arquivo
+            with open(csv_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                if not file_exists:
+                    # Cria o cabeçalho se o arquivo for novo
+                    writer.writerow(["program_id", "arrival_time", "admit_time", "wait_duration_s"])
+                
+                writer.writerow([program_id, arrival_time, admit_time, wait_duration])
         global_queue_name = "global_cluster"
         queue = get_queue(global_queue_name)
         loop = asyncio.get_running_loop()

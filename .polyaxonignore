@@ -3,7 +3,10 @@ var/logs/*
 outputs/*
 outputs_lats/*
 new_outputs_lats/*
+Testes2Engines/*
 Testes4Engines/*
+Testes8Engines/*
+TestesWillian/*
 docker/*
 LanguageAgentTreeSearch/hotpot/results/*
 wiki_cache_db.sqlite
@@ -11,3 +14,10 @@ wiki_cache_db.sqlite
 *.ipynb
 *.db
 Testes*
+.git
+cache_analysis
+depth_script
+local
+wikis
+.gitignore
+var_numbatch

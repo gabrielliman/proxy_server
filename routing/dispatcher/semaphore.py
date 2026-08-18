@@ -65,7 +65,6 @@ class SemaphoreDispatcher(BaseDispatcher):
         sem = self.semaphores[backend]
         client = self.clients[backend]
 
-        # 🔥 Entrada no semáforo = limite de concorrência real
         async with sem:
             start = None
             output_tokens = None

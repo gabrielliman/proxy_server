@@ -25,11 +25,9 @@ async def monitor_backend(url):
             if raw:
                 parsed = parse_prometheus_metrics(raw)
 
-                # ✅ 1. Fetch the global count from the process table
                 incomplete_count = PROCESS_TABLE.get_incomplete_requests_count()
                 waiting_count = PROCESS_TABLE.get_waiting_requests_count()
 
-                # ✅ 2. Pass it into the CSV writer alongside the backend metrics
                 log_kv_cache(url, parsed.get("kv_cache", []), incomplete_count, waiting_count)
 
                 with metrics_lock:

@@ -136,6 +136,7 @@ class WikiEnv(gym.Env):
         return ' '.join(sentences[:5])
 
     def search_step(self, entity):
+        # time.sleep(6)
         self.num_searches += 1
         # 1. Check if the parsed result is already in our fast database
         cursor = self.conn.execute(

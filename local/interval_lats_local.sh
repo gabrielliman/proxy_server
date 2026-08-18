@@ -1,0 +1,375 @@
+#!/bin/bash
+ulimit -n 524288
+# Model Parameters
+MODEL_NAME="meta-llama/Llama-3.1-8B-Instruct"
+MODEL_PATH="meta-llama/Llama-3.1-8B-Instruct"
+MAX_NUM_SEQS=256
+LOG_DIR="./var/logs"
+
+# Instances parameters
+NUM_INSTANCES=1      # Change this to the number of ports you want
+START_PORT=8105        # The starting port number
+PARALLELISM_VALUE=256   # The parallelism value for all ports
+GPU=1 #starting gpu
+PER_GPU=1
+GPU_PERCENT=0.95
+
+
+# Lats parameters
+BASE_URL="http://localhost:8081" #proxy server url
+ALGORITHM="lats"
+START_INDEX=0
+END_INDEX=1000 #100 programas
+ITERATIONS=10 #50
+N_GENERATE=5 #5
+N_EVALUATE=1
+N_ROLLOUT=5 #5
+DEPTH=7
+WINDOW_START=50
+WINDOW_DURATION=250
+# Benchmark parameters
+OUTPUTS_DIR="outputs_lats/testestop"
+REPEATS=1
+# RATES=("inf")
+RATES=("0.05" "0.075" "0.1" "0.25" "0.5" "0.75" "1.0" "2.0" "4.0" "8.0" "16.0")
+BURSTINESS="inf"
+BASELINE_SCHEDULER=autellix
+SCHEDULER_CONFIGS=(
+    # "fcfs:N/A"
+    # "plas:service_cumulative"
+    # "plas:kv_token_time"
+    "atlas:service_cumulative"
+    # "atlas:kv_token_time"
+
+) 
+export ENABLE_ADMISSION_CONTROL="True"  # Altere para "False" para desligar
+export ADMISSION_WINDOW_S="10.0"        # Janela da média móvel em segundos
+export ADMISSION_THRESHOLD_PCT="0.5"    # 80% do limite máximo suportado
+export ADMISSION_COOLDOWN_S="0.5"       # Tempo de recarga em segundos
+
+export HF_HOME="/mnt/scratch/global/huggingface_cache/huggingface"
+source /opt/miniconda/etc/profile.d/conda.sh
+conda activate /mnt/scratch/scheduler/envs/proxy_server
+set -x
+
+# ============================================================
+# Global Configuration
+# ============================================================
+FLASHINFER_DIR="/opt/conda/envs/proxy_server/lib/python3.12/site-packages/flashinfer/data/include/flashinfer/comm"
+
+echo "[INFO] Verificando e corrigindo headers do FlashInfer..."
+for file in "trtllm_allreduce_fusion.cuh" "trtllm_moe_allreduce_fusion.cuh"; do
+    if [ -f "$FLASHINFER_DIR/$file" ]; then
+        if ! grep -q "#include <optional>" "$FLASHINFER_DIR/$file"; then
+            echo "[INFO] Aplicando hotfix em $file..."
+            sed -i '1s/^/#include <optional>\n/' "$FLASHINFER_DIR/$file"
+        else
+            echo "[INFO] $file já está corrigido."
+        fi
+    fi
+done
+
+rm ./kv_cache_usage.csv 2>/dev/null || true
+
+# Define the ports as an array. Add or remove ports here to automatically scale.
+export MODEL="$MODEL_NAME"
+
+# Initialize empty arrays
+PORTS=()
+ROUTES_LIST=()
+PARALLELISM_LIST=()
+
+# Loop to generate the ports and JSON elements
+for (( i=0; i<NUM_INSTANCES; i++ )); do
+  PORT=$((START_PORT + i))
+  PORTS+=("$PORT")
+  ROUTES_LIST+=("\"http://localhost:$PORT\"")
+  PARALLELISM_LIST+=("\"http://localhost:$PORT\": $PARALLELISM_VALUE")
+done
+
+# Join the arrays with commas
+ROUTES_JOINED=$(IFS=,; echo "${ROUTES_LIST[*]}")
+PARALLELISM_JOINED=$(IFS=,; echo "${PARALLELISM_LIST[*]}")
+
+# Construct and export the final JSON strings
+export MODEL_ROUTES="{
+  \"$MODEL_NAME\": [
+    $ROUTES_JOINED
+  ]
+}"
+
+export BACKEND_PARALLELISM="{
+  $PARALLELISM_JOINED
+}"
+
+# ============================================================
+# Setup & Helper Functions
+# ============================================================
+mkdir -p "$LOG_DIR"
+
+wait_for_ready() {
+  local PORT=$1
+  echo "[INFO] Waiting for model on port $PORT to become ready..."
+  until curl -s -o /dev/null -w "%{http_code}" http://localhost:$PORT/health | grep -q "200"; do
+    sleep 5
+  done
+  echo "[INFO] Model on port $PORT is ready!"
+}
+
+# ============================================================
+# Start vLLM Servers
+# ============================================================
+export VLLM_SERVER_DEV_MODE=1
+echo "[INFO] Starting vLLM inference servers"
+
+
+VLLM_PIDS=()
+cleanup_engines() {
+    echo "[CLEANUP] Automatically terminating vLLM engines..."
+    for pid in "${VLLM_PIDS[@]}"; do
+        # Check if the process exists and is running
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+}
+# Trap normal exits (0), Ctrl+C (2), and error exits (15)
+trap cleanup_engines EXIT INT TERM
+
+
+ENGINE_IDX=1  # Counter to create PID1, PID2, etc.
+for PORT in "${PORTS[@]}"; do
+    echo "[INFO] Booting server on port $PORT..."
+    
+    # Your exact pipeline syntax
+    CUDA_VISIBLE_DEVICES=$GPU python -u -m vllm.entrypoints.openai.api_server \
+        --model "$MODEL_PATH" \
+        --port "$PORT" \
+        --max-num-seqs "$MAX_NUM_SEQS" \
+        --dtype bfloat16 \
+        --max-model-len 10000 \
+        --gpu-memory-utilization $GPU_PERCENT \
+        --served-model-name $MODEL_NAME \
+        > >(tee "$LOG_DIR/saida_VLLM_${PORT}.txt") 2>&1 &
+        
+    # Capture the PID explicitly
+    LATEST_PID=$!
+    VLLM_PIDS+=($LATEST_PID)
+    
+    # Dynamically assign the variable so the eval string actually works
+    eval "PID${ENGINE_IDX}=$LATEST_PID"
+    
+    # Print verification showing the variable name and value
+    eval "echo '[INFO] Engine $PORT assigned to PID${ENGINE_IDX}=\$PID${ENGINE_IDX}'"
+        
+    wait_for_ready "$PORT"
+    if (( ENGINE_IDX % $PER_GPU == 0 )); then
+        GPU=$((GPU + 1))
+    fi
+    ENGINE_IDX=$((ENGINE_IDX + 1))
+done
+# ============================================================
+# Benchmark Setup
+# ============================================================
+export CUSTOM_API_BASE="$BASE_URL"
+export CUSTOM_MODEL="$MODEL_NAME"
+# ============================================================
+# Engines (metrics + reset) dynamically generated from PORTS
+# ============================================================
+RESET_URLS=()
+PREFIX_URL=()
+
+for PORT in "${PORTS[@]}"; do
+    RESET_URLS+=("http://localhost:${PORT}/reset_prefix_cache")
+    PREFIX_URL+=("http://localhost:${PORT}/metrics")
+done
+
+# ============================================================
+# Experiment grid
+# ============================================================
+MODEL="$MODEL_NAME"
+
+mkdir -p "$OUTPUTS_DIR"
+
+# ============================================================
+# Helper: scrape per-engine metrics
+# ============================================================
+
+get_prefix_metrics_per_engine() {
+    local url=$1
+    local port=$2 # Accept the port number
+
+    curl -s "$url" | awk -v port="$port" '
+    /^vllm:prefix_cache_queries_total\{/ {
+        if (match($0, /engine="[^"]+"/)) {
+            engine_str = substr($0, RSTART, RLENGTH)
+            split(engine_str, parts, /"/)
+            engine = parts[2]
+            queries[engine] = $NF
+        }
+    }
+
+    /^vllm:prefix_cache_hits_total\{/ {
+        if (match($0, /engine="[^"]+"/)) {
+            engine_str = substr($0, RSTART, RLENGTH)
+            split(engine_str, parts, /"/)
+            engine = parts[2]
+            hits[engine] = $NF
+        }
+    }
+
+    END {
+        for (e in queries) {
+            q = queries[e] + 0
+            h = (e in hits ? hits[e] : 0) + 0
+
+            # Prepend the port to the engine to guarantee uniqueness
+            printf "%s_%s %f %f\n", port, e, q, h
+        }
+    }'
+}
+# ============================================================
+# baseline LOOP
+# ============================================================
+for RUN in $(seq 1 $REPEATS); do
+    for sched_conf in "${SCHEDULER_CONFIGS[@]}"; do
+        IFS=':' read -r scheduler plas_metric <<< "$sched_conf"
+
+        # Create a clear string for the JSON filename
+        sched_suffix=$scheduler
+        if [ "$scheduler" = "plas" ] || [ "$scheduler" = "atlas" ]; then
+            sched_suffix="${scheduler}_${plas_metric}"
+        fi
+
+        for rate in "${RATES[@]}"; do
+
+            # ------------------------------------
+            # Start proxy server
+            # ------------------------------------
+                echo "Run $RUN / $REPEATS [Baseline]"
+                PROXY_ERROR="${OUTPUTS_DIR}/ERROR_proxy_rate${rate}_run${RUN}.txt"
+
+                SCHEDULER="$scheduler" \
+                PLAS_METRIC_TYPE="$plas_metric" \
+                LOAD_BALANCER_STRATEGY="autellix" \
+                python main.py 2> "$PROXY_ERROR" &
+                PROXY_PID=$!
+                sleep 10  # tempo para proxy + engines estabilizarem
+
+                for url in "${RESET_URLS[@]}"; do
+                    curl -s -X POST "$url" > /dev/null
+                done
+                sleep 2
+
+                unset before_q before_h prefix_json_map
+                declare -A before_q
+                declare -A before_h
+
+                for PORT in "${PORTS[@]}"; do
+                    url="http://localhost:${PORT}/metrics"
+                    while read -r engine q h; do
+                        before_q[$engine]=$q
+                        before_h[$engine]=$h
+                    done < <(get_prefix_metrics_per_engine "$url" "$PORT")
+                done
+                OUTPUT_JSON="${OUTPUTS_DIR}/interval_rate${rate}_run${RUN}.json"
+                OUTPUT_ERROR="${OUTPUTS_DIR}/ERROR_interval_rate${rate}_run${RUN}.txt"
+                OUTPUT_KV_CACHE="${OUTPUTS_DIR}/interval_rate${rate}_run${RUN}_kv_cache.csv"
+                OUTPUT_ADMISSION="${OUTPUTS_DIR}/interval_rate${rate}_run${RUN}_admission_log.csv"
+                python LanguageAgentTreeSearch/hotpot/run_interval.py \
+                    --algorithm $ALGORITHM \
+                    --task_start_index $START_INDEX \
+                    --task_end_index $END_INDEX \
+                    --iterations $ITERATIONS \
+                    --n_generate_sample $N_GENERATE \
+                    --n_evaluate_sample $N_EVALUATE \
+                    --n_rollout $N_ROLLOUT \
+                    --output-json $OUTPUT_JSON \
+                    --burstiness $BURSTINESS \
+                    --program-rate "$rate" \
+                    --depth_limit "$DEPTH" \
+                    --window_start "$WINDOW_START" \
+                    --window_duration "$WINDOW_DURATION" \
+                    --is_baseline_run 1 2> "$OUTPUT_ERROR"
+                #Matando o proxy
+                PROG_FILE="${OUTPUTS_DIR}/processes_summary_rate${rate}_run${RUN}.json"
+                curl -s "${BASE_URL}/processes_summary" | python3 -m json.tool > "$PROG_FILE"
+                echo "Stopping proxy (PID=$PROXY_PID)"
+                kill -9 "$PROXY_PID"
+                wait "$PROXY_PID" 2>/dev/null || true
+                mv ./kv_cache_usage.csv "$OUTPUT_KV_CACHE"
+                mv ./admission_log.csv "$OUTPUT_ADMISSION"
+                sleep 5
+
+            
+
+                declare -A prefix_json_map
+
+                for PORT in "${PORTS[@]}"; do
+                    url="http://localhost:${PORT}/metrics"
+                    while read -r engine q h; do
+                        before_queries=${before_q[$engine]:-0}
+                        before_hits=${before_h[$engine]:-0}
+
+                        dq=$(awk -v q="${q:-0}" -v bq="${before_queries:-0}" 'BEGIN { print q - bq }')
+                        dh=$(awk -v h="${h:-0}" -v bh="${before_hits:-0}" 'BEGIN { print h - bh }')
+                        hr=$(awk -v dh="${dh:-0}" -v dq="${dq:-0}" 'BEGIN { if (dq>0) printf "%.6f", dh/dq; else print 0 }')
+
+                        prefix_json_map[$engine]="{\"queries\":${dq:-0},\"hits\":${dh:-0},\"hit_rate\":${hr:-0}}"
+                    done < <(get_prefix_metrics_per_engine "$url" "$PORT")
+                done
+
+                # ------------------------------------
+                # Build JSON object
+                # ------------------------------------
+                prefix_json="{"
+                first=1
+                for engine in "${!prefix_json_map[@]}"; do
+                    if [ $first -eq 0 ]; then
+                        prefix_json+=","
+                    fi
+                    prefix_json+="\"engine_${engine}\":${prefix_json_map[$engine]}"
+                    first=0
+                done
+
+                prefix_json+="}"
+
+                # ------------------------------------
+                # Inject into benchmark JSON
+                # ------------------------------------
+                python3 -c '
+import sys, json
+
+file_path = sys.argv[1]
+prefix_data = json.loads(sys.argv[2])
+scheduler = sys.argv[3]
+strategy = sys.argv[4]
+rate = float(sys.argv[5])
+start = int(sys.argv[6])
+end = int(sys.argv[7])
+
+with open(file_path, "r") as f:
+    data = json.load(f)
+
+if "full_metrics" not in data:
+    data["full_metrics"] = {}
+
+data["full_metrics"]["prefix_cache"] = prefix_data
+data["full_metrics"]["scheduler"] = scheduler
+data["full_metrics"]["load_balancer"] = strategy
+data["full_metrics"]["request_rate"] = rate
+data["full_metrics"]["num_conversations"] = end-start
+
+with open(file_path, "w") as f:
+    json.dump(data, f, indent=2)
+' "$OUTPUT_JSON" "$prefix_json" "$sched_suffix" "autellix" "$rate" "$START_INDEX" "$END_INDEX"
+
+                echo "Metrics injected into JSON"
+                echo "--------------------------------------"
+        done # End of rates loop
+    done # End of scheduler configs loop
+done # End of repeats loop (This 'done' was missing!)
+
+echo "======================================"
+echo "All benchmarks completed successfully."
+echo "======================================"

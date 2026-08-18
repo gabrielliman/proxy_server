@@ -3,13 +3,13 @@ ulimit -n 524288
 # Model Parameters
 MODEL_NAME="meta-llama/Llama-3.1-8B-Instruct"
 MODEL_PATH="meta-llama/Llama-3.1-8B-Instruct"
-MAX_NUM_SEQS=100
+MAX_NUM_SEQS=10
 LOG_DIR="./var/logs"
 
 # Instances parameters
 NUM_INSTANCES=2       # Change this to the number of ports you want
 START_PORT=8105        # The starting port number
-PARALLELISM_VALUE=150   # The parallelism value for all ports
+PARALLELISM_VALUE=10   # The parallelism value for all ports
 GPU=0 #starting gpu
 PER_GPU=1
 GPU_PERCENT=0.745
@@ -18,29 +18,30 @@ GPU_PERCENT=0.745
 # Lats parameters
 BASE_URL="http://localhost:8081" #proxy server url
 ALGORITHM="lats"
-START_INDEX=999
+START_INDEX=998
 END_INDEX=1000 #100 programas
-ITERATIONS=1 #50
+ITERATIONS=3 #50
 N_GENERATE=1 #5
 N_EVALUATE=1
+N_ROLLOUT=1 #5
 DEPTH=7
 # Benchmark parameters
-OUTPUTS_DIR="outputs_lats/repeats"
-REPEATS=3
+OUTPUTS_DIR="outputs_lats/teste2"
+REPEATS=1
 RATES=("inf")
 # RATES=("0.5" "1" "2" "4" "8")
 BURSTINESS=0.1
 BASELINE_SCHEDULER=autellix
 EXPERIMENT_CONFIGS=(
     #baseline fcfs
-    "atlas:service_cumulative:least-total-load:N/A:0"
+    # "atlas:service_cumulative:least-total-load:N/A:0"
     #baseline autellix
     #"atlas:service_cumulative:autellix:N/A:0"
     # "atlas:service_cumulative:threshold-autellix:total:15"
     # "atlas:service_cumulative:ordered-dynamic-autellix:N/A:0"
     # "atlas:service_cumulative:least-load-dynamic-autellix:N/A:0"
     # "atlas:service_cumulative:probabilistic-cascade-autellix:N/A:0"
-    # "atlas:service_cumulative:ordered-dynamic-autellix-reorder:N/A:0"
+    "atlas:service_cumulative:ordered-dynamic-autellix-reorder:N/A:0"
     # "atlas:service_cumulative:probabilistic-cascade-autellix-reorder:N/A:0"
 
     #nossa proposta escalonador
@@ -294,6 +295,7 @@ for RUN in $(seq 1 $REPEATS); do
                     --iterations $ITERATIONS \
                     --n_generate_sample $N_GENERATE \
                     --n_evaluate_sample $N_EVALUATE \
+                    --n_rollout $N_ROLLOUT \
                     --output-json $OUTPUT_JSON \
                     --burstiness $BURSTINESS \
                     --program-rate "$rate" \
@@ -454,6 +456,7 @@ with open(file_path, "w") as f:
                         --iterations $ITERATIONS \
                         --n_generate_sample $N_GENERATE \
                         --n_evaluate_sample $N_EVALUATE \
+                        --n_rollout $N_ROLLOUT \
                         --output-json $OUTPUT_JSON \
                         --burstiness $BURSTINESS \
                         --program-rate "$rate" \

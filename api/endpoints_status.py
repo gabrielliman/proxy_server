@@ -3,9 +3,16 @@ from routing.selector import backend_metrics, metrics_lock
 from request_queue.manager import get_queue_state
 import asyncio
 from routing.process_table import PROCESS_TABLE
+import os
+import signal
+from fastapi import HTTPException, Body
+from routing.load_balancer import LOAD_BALANCER
+from pydantic import BaseModel
 
 router = APIRouter()
 
+class ProgramCompleteRequest(BaseModel):
+    program_id: str
 
 @router.get("/status")
 async def status():
@@ -28,6 +35,11 @@ async def processes():
 async def processes_summary():
     print("Fetching process table summary")
     return PROCESS_TABLE.sum_processes()
+
+@router.get("/processes_detail")
+async def processes_detail():
+    from routing.process_table import PROCESS_TABLE
+    return PROCESS_TABLE.list_processes()
 
 @router.get("/waiting_time/{program_id}")
 async def get_waiting_time(program_id: str):
@@ -59,3 +71,43 @@ async def waiting_requests_count():
     # print("Fetching waiting requests count")
     count = PROCESS_TABLE.get_waiting_requests_count()
     return {"waiting_requests": count}
+
+from routing.queue_manager import get_queue
+@router.delete("/purge_waiting")
+async def purge_waiting():
+    """
+    Esvazia a fila de requisições pendentes, limpa a tabela de processos
+    e bloqueia o proxy para não receber mais requisições vLLM.
+    """
+    cleared_queue_items = 0
+    try:
+        queue = get_queue("global_cluster")
+        while not queue.empty():
+            queue.get_nowait()
+            cleared_queue_items += 1
+    except Exception as e:
+        print(f"[PURGE ERROR] Falha ao limpar a fila do asyncio: {e}")
+
+    purge_stats = PROCESS_TABLE.purge_waiting_and_stale()
+
+    PROCESS_TABLE.accepting_requests = False
+    
+    return {
+        "status": "success",
+        "accepting_new_requests": PROCESS_TABLE.accepting_requests,
+        "cleared_queue_items": cleared_queue_items,
+        "removed_waiting_threads": purge_stats["removed_threads"],
+        "removed_programs_count": len(purge_stats["removed_programs"]),
+        "removed_program_ids": purge_stats["removed_programs"]
+    }
+
+@router.post("/program/complete")
+async def complete_program(payload: ProgramCompleteRequest):
+    """Notifica o Load Balancer que o programa terminou para limpar o estado/afinidade."""
+    try:
+        await LOAD_BALANCER.on_program_complete(payload.program_id)
+        return {"status": "success", "message": f"Program {payload.program_id} completed"}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()  # Prints the full stack trace to server logs
+        raise HTTPException(status_code=500, detail=str(e))

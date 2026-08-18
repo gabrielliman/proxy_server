@@ -4,8 +4,10 @@ import time
 from abc import ABC, abstractmethod
 from threading import Lock
 from typing import Dict, Optional, List
-
+from collections import deque
 import httpx
+import os
+import csv
 
 from config.settings import (
     ALL_BACKENDS,
@@ -19,6 +21,7 @@ from config.settings import (
     LOAD_BALANCER_THRESHOLD_VALUE,      # e.g., 90.0, 10.0, etc.
     LOAD_BALANCER_FALLBACK_STRATEGY,    # e.g., "least-total-load"
 )
+import config.settings as settings
 
 from routing.process_table import PROCESS_TABLE
 
@@ -169,8 +172,7 @@ class LeastKVCacheStrategy(LoadBalancerStrategy):
                 best_engine = engine
 
         return best_engine
-
-    
+  
 class AutelixStrategy(LoadBalancerStrategy):
     """
     Autellix-style: short requests -> least-used engine; long requests -> pinned per-program engine.
@@ -200,7 +202,10 @@ class AutelixStrategy(LoadBalancerStrategy):
         return engine
 
     async def on_program_complete(self, program_id: str):
-        PROCESS_TABLE.clear_preferred_engine(program_id)
+        if hasattr(PROCESS_TABLE, "clear_preferred_engines"):
+            PROCESS_TABLE.clear_preferred_engines(program_id)
+        elif hasattr(PROCESS_TABLE, "clear_preferred_engine"):
+            PROCESS_TABLE.clear_preferred_engine(program_id)
 
 
     def _select_least_used(self, metrics: Dict[str, Dict]) -> str:
@@ -219,7 +224,6 @@ class AutelixStrategy(LoadBalancerStrategy):
                     candidates.append(engine)
 
             return random.choice(candidates) if candidates else random.choice(ALL_BACKENDS)
-
 
 class ThresholdAutellixStrategy(LoadBalancerStrategy):
     """
@@ -292,7 +296,10 @@ class ThresholdAutellixStrategy(LoadBalancerStrategy):
         )
 
     async def on_program_complete(self, program_id: str):
-        PROCESS_TABLE.clear_preferred_engine(program_id)
+        if hasattr(PROCESS_TABLE, "clear_preferred_engines"):
+            PROCESS_TABLE.clear_preferred_engines(program_id)
+        elif hasattr(PROCESS_TABLE, "clear_preferred_engine"):
+            PROCESS_TABLE.clear_preferred_engine(program_id)
 
 class BaseDynamicAutellixStrategy(LoadBalancerStrategy):
     """Classe base contendo a lógica compartilhada para Autellix Dinâmico."""
@@ -412,8 +419,10 @@ class BaseDynamicAutellixStrategy(LoadBalancerStrategy):
             preferred.sort(key=get_dominance_score, reverse=True)
 
     async def on_program_complete(self, program_id: str):
-        PROCESS_TABLE.clear_preferred_engines(program_id)
-
+        if hasattr(PROCESS_TABLE, "clear_preferred_engines"):
+            PROCESS_TABLE.clear_preferred_engines(program_id)
+        elif hasattr(PROCESS_TABLE, "clear_preferred_engine"):
+            PROCESS_TABLE.clear_preferred_engine(program_id)
 
 class OrderedDynamicAutellixStrategy(BaseDynamicAutellixStrategy):
     """
@@ -488,7 +497,6 @@ class OrderedReorderDynamicAutellixStrategy(BaseDynamicAutellixStrategy):
 
         return self._select_least_used_global(metrics)
 
-
 class LeastLoadDynamicAutellixStrategy(BaseDynamicAutellixStrategy):
     """
     Least Load: Avalia todas as engines favoritas e envia para a mais ociosa.
@@ -525,7 +533,6 @@ class LeastLoadDynamicAutellixStrategy(BaseDynamicAutellixStrategy):
 
         # Fallback caso não tenha program_id
         return self._select_least_used_global(metrics)
-
 
 class ProbabilisticReorderCascadeAutellixStrategy(BaseDynamicAutellixStrategy):
     """
@@ -723,6 +730,26 @@ class LoadBalancer:
         self.metrics_lock = Lock()
         self.last_metrics_log = 0.0
         self.metrics_query_task: Optional[asyncio.Task] = None
+        self.aimd_lock = Lock()
+        self.aimd_alpha = getattr(settings, 'AIMD_ALPHA', 1.0)          # Additive Increase
+        self.aimd_beta = getattr(settings, 'AIMD_BETA', 0.75)           # Multiplicative Decrease
+        self.aimd_punishment_cooldown_s = 2 * getattr(settings, 'ADMISSION_WINDOW_S', 10.0)
+        self.aimd_throughput_drop_tolerance = getattr(settings, 'AIMD_THROUGHPUT_DROP_TOLERANCE', 0.10)
+        self.aimd_hit_rate_drop_tolerance = getattr(settings, 'AIMD_HIT_RATE_DROP_TOLERANCE', 0.05)
+        
+        self.aimd_current_limit = getattr(settings, 'ADMISSION_INITIAL_LIMIT', 10.0)
+        
+        # Controle de Sessões (Programas)
+        self.active_programs = set()    # Demanda Total
+        self.admitted_programs = set()  # Festa (programas liberados para gerar requests)
+        
+        # Histórico Deslizante (Janela)
+        self.raw_metrics_history = deque() # Armazena tuples: (time, total_hits, total_queries, total_tokens)
+        self.last_window_throughput = 0.0
+        self.last_window_hit_rate = 0.0
+        self.last_punishment_time = time.time()
+        
+        self.has_received_traffic = False
 
     def _get_fallback_strategy(self, fallback_name: str) -> LoadBalancerStrategy:
         """Helper to instantiate the chosen fallback strategy."""
@@ -827,7 +854,70 @@ class LoadBalancer:
 
     
     async def on_program_complete(self, program_id: str):
+        # Libera espaço no AIMD quando um programa finaliza completamente
+        with self.aimd_lock:
+            self.active_programs.discard(program_id)
+            self.admitted_programs.discard(program_id)
         await self.strategy.on_program_complete(program_id)
+
+    async def wait_for_admission(self, program_id: str):
+        """Bloqueia novas requisições de um programa até que haja espaço sob o teto do AIMD."""
+        if not getattr(settings, 'ENABLE_ADMISSION_CONTROL', False) or not program_id:
+            return
+
+        with self.aimd_lock:
+            self.active_programs.add(program_id)
+            if program_id in self.admitted_programs:
+                return
+        
+        # Loop passivo assíncrono de espera
+        while True:
+            with self.aimd_lock:
+                # O limite acompanha o float, mas para admissão usamos a lotação real (len)
+                if len(self.admitted_programs) < self.aimd_current_limit:
+                    self.admitted_programs.add(program_id)
+                    return
+            await asyncio.sleep(0.1)
+
+    def _log_aimd_decision(self, now, action, old_limit, new_limit, demand, 
+                           hr, last_hr, tp, last_tp, 
+                           insta_hr, insta_tp,
+                           window_running, window_waiting, window_kv,
+                           insta_running, insta_waiting, insta_kv):
+        """
+        Grava um snapshot do estado do AIMD no exato momento da decisão.
+        """
+        import config.settings as settings
+        import csv
+        import os
+        
+        csv_path = getattr(settings, 'AIMD_LOG_CSV', 'aimd_decisions.csv')
+        
+        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+        file_exists = os.path.exists(csv_path)
+        
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow([
+                    "timestamp", "action", "old_limit", "new_limit", 
+                    "demand_active_programs", 
+                    "window_hit_rate", "last_window_hit_rate", 
+                    "window_throughput", "last_window_throughput",
+                    "insta_hit_rate", "insta_throughput",
+                    "window_running", "window_waiting", "window_kv_cache",
+                    "insta_running", "insta_waiting", "insta_kv_cache"
+                ])
+                
+            writer.writerow([
+                f"{now:.3f}", action, f"{old_limit:.2f}", f"{new_limit:.2f}", 
+                demand, 
+                f"{hr:.4f}", f"{last_hr:.4f}", 
+                f"{tp:.2f}", f"{last_tp:.2f}",
+                f"{insta_hr:.4f}", f"{insta_tp:.2f}",
+                f"{window_running:.2f}", f"{window_waiting:.2f}", f"{window_kv:.2f}",
+                f"{insta_running:.2f}", f"{insta_waiting:.2f}", f"{insta_kv:.2f}"
+            ])
 
     async def on_call_complete(self, program_id: str, engine_id: str):
         await self.strategy.on_call_complete(program_id, engine_id)
@@ -863,22 +953,181 @@ class LoadBalancer:
     async def _query_engine_metrics(self):
         tasks = [self._fetch_engine_metrics(e) for e in ALL_BACKENDS]
         results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        current_hits = 0
+        current_queries = 0
+        current_tokens = 0
+        
         with self.metrics_lock:
             for engine, res in zip(ALL_BACKENDS, results):
                 if isinstance(res, dict):
-                    self.metrics_cache.setdefault(engine, {})
                     self.metrics_cache[engine].update(res)
                 else:
-                    self.metrics_cache.setdefault(engine, {})["query_error"] = str(res)
+                    self.metrics_cache[engine]["query_error"] = str(res)
+                    
+                # CORREÇÃO: Extrair as métricas globais do CACHE (que retém os contadores 
+                # antigos em caso de falha), e não do 'res' instantâneo.
+                cached_m = self.metrics_cache[engine]
+                
+                current_hits += cached_m.get("raw_prefix_hits", 0)
+                current_queries += cached_m.get("raw_prefix_queries", 0)
+                current_tokens += cached_m.get("raw_prompt_tokens", 0) + cached_m.get("raw_gen_tokens", 0)
 
-            # include local workload counts from PROCESS_TABLE if available
-            if hasattr(PROCESS_TABLE, "get_all_engine_workloads"):
-                workloads = PROCESS_TABLE.get_all_engine_workloads()
-            else:
-                workloads = {}
-            for engine in ALL_BACKENDS:
-                self.metrics_cache.setdefault(engine, {})
-                self.metrics_cache[engine]["local_active_requests"] = workloads.get(engine, 0)
+            # Extrai instantâneos de gauge (filas e memória) de todo o cluster
+            metrics_vals = self.metrics_cache.values()
+            total_waiting = sum(int(m.get("waiting", 0)) for m in metrics_vals)
+            total_running = sum(int(m.get("running", 0)) for m in metrics_vals)
+            
+            kv_caches = [float(m.get("kv_cache_percent", 0.0)) for m in metrics_vals if "kv_cache_percent" in m]
+            avg_kv_cache = sum(kv_caches) / len(kv_caches) if kv_caches else 0.0
+
+        now = time.time()
+        
+        with self.aimd_lock:
+            if current_tokens > 0:
+                self.has_received_traffic = True
+                # NOVO: Adicionado running, waiting e kv_cache na tupla do histórico
+                self.raw_metrics_history.append((
+                    now, current_hits, current_queries, current_tokens, 
+                    total_running, total_waiting, avg_kv_cache
+                ))
+                
+            window_s = getattr(settings, 'ADMISSION_WINDOW_S', 10.0)
+            history_limit_s = window_s * 2.0 
+            
+            while self.raw_metrics_history and now - self.raw_metrics_history[0][0] > history_limit_s:
+                self.raw_metrics_history.popleft()
+                
+            mid_idx = -1
+            for i in range(len(self.raw_metrics_history) - 1, -1, -1):
+                if now - self.raw_metrics_history[i][0] >= window_s:
+                    mid_idx = i
+                    break
+                    
+            if mid_idx == -1:
+                return
+                
+            oldest = self.raw_metrics_history[0]   
+            mid = self.raw_metrics_history[mid_idx] 
+            newest = self.raw_metrics_history[-1]   
+            
+            delta_time_curr = newest[0] - mid[0]
+            delta_time_prev = mid[0] - oldest[0]
+            
+            if delta_time_curr > 0 and delta_time_prev > (window_s * 0.5):
+                
+                # Métricas Janela ATUAL (Acumuladores)
+                curr_hits = newest[1] - mid[1]
+                curr_queries = newest[2] - mid[2]
+                curr_tokens = newest[3] - mid[3]
+                
+                window_throughput = curr_tokens / delta_time_curr
+                window_hit_rate = curr_hits / curr_queries if curr_queries > 0 else 1.0
+                
+                # Métricas Janela ATUAL (Gauge Averages)
+                # Pega a fatia da história referente à janela atual para calcular médias
+                curr_window_slice = list(self.raw_metrics_history)[mid_idx:]
+                window_running = sum(x[4] for x in curr_window_slice) / len(curr_window_slice) if curr_window_slice else 0
+                window_waiting = sum(x[5] for x in curr_window_slice) / len(curr_window_slice) if curr_window_slice else 0
+                window_kv = sum(x[6] for x in curr_window_slice) / len(curr_window_slice) if curr_window_slice else 0
+
+                # Métricas Janela ANTERIOR
+                prev_hits = mid[1] - oldest[1]
+                prev_queries = mid[2] - oldest[2]
+                prev_tokens = mid[3] - oldest[3]
+                
+                prev_window_throughput = prev_tokens / delta_time_prev
+                prev_window_hit_rate = prev_hits / prev_queries if prev_queries > 0 else 1.0
+                
+                # Métricas INSTANTÂNEAS (Último tick vs Penúltimo tick)
+                insta_running = newest[4]
+                insta_waiting = newest[5]
+                insta_kv = newest[6]
+                
+                if len(self.raw_metrics_history) >= 2:
+                    last_pt = self.raw_metrics_history[-2]
+                    dt_insta = newest[0] - last_pt[0]
+                    insta_hits = newest[1] - last_pt[1]
+                    insta_queries = newest[2] - last_pt[2]
+                    insta_tokens = newest[3] - last_pt[3]
+                    
+                    insta_throughput = insta_tokens / dt_insta if dt_insta > 0 else 0
+                    insta_hit_rate = insta_hits / insta_queries if insta_queries > 0 else 1.0
+                else:
+                    insta_throughput = window_throughput
+                    insta_hit_rate = window_hit_rate
+                
+                # --- PROTEÇÃO CONTRA MÉTRICAS ZUMBIS ---
+                # Usamos os valores instantâneos já calculados
+                if (curr_queries == 0 or window_throughput == 0) and (insta_waiting + insta_running > 0):
+                    return  
+                # ---------------------------------------
+
+                hr_dropped = window_hit_rate < (prev_window_hit_rate * (1.0 - self.aimd_hit_rate_drop_tolerance))
+                tp_dropped = window_throughput < (prev_window_throughput * (1.0 - self.aimd_throughput_drop_tolerance))
+                
+                in_cooldown = (now - self.last_punishment_time) < self.aimd_punishment_cooldown_s
+                
+                demand = len(self.active_programs)
+                old_limit = self.aimd_current_limit
+                action = "HOLD"
+
+                real_tp_drop = tp_dropped # and (insta_waiting > 0)
+                
+                if hr_dropped or real_tp_drop:
+                    if not in_cooldown:
+                        self.aimd_current_limit = max(2.0, self.aimd_current_limit * self.aimd_beta)
+                        self.last_punishment_time = now
+                        if hr_dropped: action = "DECREASE_HIT_RATE"
+                        if real_tp_drop: action = "DECREASE_THROUGHPUT"
+                        if hr_dropped and real_tp_drop: action = "DECREASE_BOTH"
+                    else:
+                        action = "COOLDOWN_SKIP"
+                else:
+                    new_potential_limit = self.aimd_current_limit + self.aimd_alpha
+                    if new_potential_limit <= max(2.0, float(demand)):
+                        self.aimd_current_limit = new_potential_limit
+                        action = "INCREASE"
+                    else:
+                        self.aimd_current_limit = max(2.0, float(demand))
+                        action = "CAPPED_BY_DEMAND"
+                
+                self._log_aimd_decision(
+                    now, action, old_limit, self.aimd_current_limit, demand, 
+                    window_hit_rate, prev_window_hit_rate, window_throughput, prev_window_throughput,
+                    insta_hit_rate, insta_throughput,
+                    window_running, window_waiting, window_kv,
+                    insta_running, insta_waiting, insta_kv
+                )
+
+    def can_admit_new_program(self) -> bool:
+        """Calcula a média móvel e decide se o cluster tem capacidade para novos programas."""
+        if not getattr(settings, 'ENABLE_ADMISSION_CONTROL', False):
+            self.last_admission_time = time.time()
+            return True
+        
+        now = time.time()
+        cooldown_s = getattr(settings, 'ADMISSION_COOLDOWN_S', 1.0)
+            
+        with self.admission_lock:
+            if now - self.last_admission_time < cooldown_s:
+                return False
+            if not self.load_history:
+                self.last_admission_time = time.time()
+                return True
+                
+            # Calcula a média aritmética do período
+            total_load = sum(count for _, count in self.load_history)
+            avg_load = total_load / len(self.load_history)
+
+        max_capacity = 512
+        threshold_pct = getattr(settings, 'ADMISSION_THRESHOLD_PCT', 0.8)
+
+        if (avg_load < (max_capacity * threshold_pct)):
+            self.last_admission_time = time.time()
+            return True
+        else:
+            return False
 
     async def _fetch_engine_metrics(self, engine_url: str) -> Dict:
         """
@@ -890,111 +1139,62 @@ class LoadBalancer:
         try:
             async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
                 resp = await client.get(f"{engine_url}/metrics", timeout=2.0)
-
-                if resp.status_code != 200:
-                    return {"error": f"Status {resp.status_code}"}
-
+                if resp.status_code != 200: return {"error": f"Status {resp.status_code}"}
                 text = resp.text
-
         except Exception as e:
             return {"error": str(e)}
 
-        # --------------------------
-        # Parse Prometheus text
-        # --------------------------
         parsed = {}
         for line in text.splitlines():
             line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-
-            # remove labels
-            if "#" in line:
-                line = line.split("#", 1)[0].strip()
-
+            if not line or line.startswith("#"): continue
+            if "#" in line: line = line.split("#", 1)[0].strip()
             parts = line.split()
-            if len(parts) < 2:
-                continue
-
-            metric_name = parts[0]
-            value = parts[-1]
-
+            if len(parts) < 2: continue
+            
             try:
-                parsed[metric_name] = float(value)
+                parsed[parts[0]] = float(parts[-1])
             except Exception:
-                parsed[metric_name] = value
+                parsed[parts[0]] = parts[-1]
 
-        # --------------------------
-        # Strict metric extraction
-        # --------------------------
         result = {}
-
-        prefix_hits_total = None
-        prefix_queries_total = None
-
-        prompt_tokens_total = None
-        generation_tokens_total = None
+        prefix_hits_total = prefix_queries_total = None
+        prompt_tokens_total = generation_tokens_total = None
         process_start_time = None
 
         for raw_key, v in parsed.items():
-            base = raw_key.split("{", 1)[0]  # strip labels
+            base = raw_key.split("{", 1)[0]
 
-            # ACTIVE REQUESTS
-            if base == "vllm:num_requests_running":
-                result["running"] = int(v)
+            if base == "vllm:num_requests_running": result["running"] = int(v)
+            elif base == "vllm:num_requests_waiting": result["waiting"] = int(v)
+            elif base == "vllm:kv_cache_usage_perc": result["kv_cache_percent"] = float(v) * 100.0
+            
+            # Acúmulo de variáveis para a Janela AIMD
+            elif base == "vllm:prefix_cache_hits_total": prefix_hits_total = float(v)
+            elif base == "vllm:prefix_cache_queries_total": prefix_queries_total = float(v)
+            elif base == "vllm:prompt_tokens_total": prompt_tokens_total = float(v)
+            elif base == "vllm:generation_tokens_total": generation_tokens_total = float(v)
+            elif base == "process_start_time_seconds": process_start_time = float(v)
+            
+            elif any(s in base for s in ["_sum", "_count", "_bucket", "_created"]): continue
+            else: result[base] = v
 
-            elif base == "vllm:num_requests_waiting":
-                result["waiting"] = int(v)
+        # Passa os dados brutos absolutos adiante para análise delta
+        if prefix_hits_total is not None: result["raw_prefix_hits"] = prefix_hits_total
+        if prefix_queries_total is not None: result["raw_prefix_queries"] = prefix_queries_total
+        if prompt_tokens_total is not None: result["raw_prompt_tokens"] = prompt_tokens_total
+        if generation_tokens_total is not None: result["raw_gen_tokens"] = generation_tokens_total
 
-            # KV CACHE USAGE (0-1) → convert to %
-            elif base == "vllm:kv_cache_usage_perc":
-                result["kv_cache_percent"] = float(v) * 100.0
-
-            # PREFIX CACHE COUNTERS
-            elif base == "vllm:prefix_cache_hits_total":
-                prefix_hits_total = float(v)
-
-            elif base == "vllm:prefix_cache_queries_total":
-                prefix_queries_total = float(v)
-
-            # TOKEN TOTAL COUNTERS
-            elif base == "vllm:prompt_tokens_total":
-                prompt_tokens_total = float(v)
-
-            elif base == "vllm:generation_tokens_total":
-                generation_tokens_total = float(v)
-
-            # PROCESS START TIME
-            elif base == "process_start_time_seconds":
-                process_start_time = float(v)
-
-            # ignore histogram buckets, created, sum, count
-            elif any(s in base for s in ["_sum", "_count", "_bucket", "_created"]):
-                continue
-
-            else:
-                # keep other metrics with clean names
-                result[base] = v
-
-        # --------------------------
-        # Compute prefix hit rate
-        # --------------------------
+        # Mantém as compilações antigas (tps/hit rate) apenas para compatibilidade de log
         if prefix_hits_total is not None and prefix_queries_total:
             result["prefix_cache_hits"] = prefix_hits_total
             result["prefix_cache_queries"] = prefix_queries_total
             result["prefix_cache_hit_rate"] = prefix_hits_total / prefix_queries_total
 
-        # --------------------------
-        # Compute throughput (tokens/sec)
-        # --------------------------
         if process_start_time:
             uptime = max(1.0, time.time() - process_start_time)
-
-            if prompt_tokens_total is not None:
-                result["prompt_tps"] = prompt_tokens_total / uptime
-
-            if generation_tokens_total is not None:
-                result["gen_tps"] = generation_tokens_total / uptime
+            if prompt_tokens_total is not None: result["prompt_tps"] = prompt_tokens_total / uptime
+            if generation_tokens_total is not None: result["gen_tps"] = generation_tokens_total / uptime
 
         return result
 
@@ -1017,12 +1217,18 @@ class LoadBalancer:
                     if all(sub in lk for sub in keys_subs):
                         return v
                 return None
-
-            running = em.get("running") or em.get("local_active_requests") or em.get("active") or 0
-            waiting = em.get("queue_size") or em.get("waiting") or 0
-
-            kv = em.get("kv_cache_percent") or find_metric(["kv", "cache"]) or None
-            prefix_hit = em.get("prefix_cache_hit_rate") or find_metric(["prefix", "hit"]) or None
+ 
+            def first_not_none(*values):
+                for v in values:
+                    if v is not None:
+                        return v
+                return None
+ 
+            running = first_not_none(em.get("running"), em.get("local_active_requests"), em.get("active"), 0)
+            waiting = first_not_none(em.get("queue_size"), em.get("waiting"), 0)
+ 
+            kv = first_not_none(em.get("kv_cache_percent"), find_metric(["kv", "cache"]))
+            prefix_hit = first_not_none(em.get("prefix_cache_hit_rate"), find_metric(["prefix", "hit"]))
 
             def as_float(x):
                 try:

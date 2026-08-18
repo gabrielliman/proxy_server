@@ -8,7 +8,7 @@ from api.endpoints_status import router as status_router
 from metrics.monitor import start_monitoring_tasks
 from routing.process_table import PROCESS_TABLE
 from routing.load_balancer import LOAD_BALANCER
-from config.settings import PROCESS_TABLE_PRUNE_TTL, PROCESS_TABLE_PRUNE_INTERVAL
+from config.settings import PROCESS_TABLE_PRUNE_TTL, PROCESS_TABLE_PRUNE_INTERVAL, PROXY_PORT
 
 
 @asynccontextmanager
@@ -42,4 +42,4 @@ app.include_router(status_router)
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8081)
+    uvicorn.run("main:app", host="0.0.0.0", port=PROXY_PORT)

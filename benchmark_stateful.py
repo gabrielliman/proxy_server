@@ -59,6 +59,9 @@ def _tpot_list(reqs: List[RequestMetrics]) -> List[float]:
             tpot_list.append((r.latency)/ (r.output_tokens - 1))
     return tpot_list
 
+def max_request_token_count(reqs) -> int:
+    return max((r.input_tokens + r.output_tokens) for r in reqs) if reqs else 0
+
 
 def summarize_program(prog: ProgramMetrics) -> Dict[str, Any]:
     if not prog.requests:
@@ -67,6 +70,7 @@ def summarize_program(prog: ProgramMetrics) -> Dict[str, Any]:
     latencies = [r.latency for r in prog.requests if r.latency > 0]    #latencia de uma requisicao é o tempo desde que foi enviada para o escalonador ate receber resposta
     output_tokens = [r.output_tokens for r in prog.requests]
     input_tokens = [r.input_tokens for r in prog.requests]
+    max_request_tokens = max_request_token_count(prog.requests)
     start = min(r.start_time for r in prog.requests)
     end = max(r.end_time for r in prog.requests)
     full_time = float(end - start)
@@ -82,13 +86,15 @@ def summarize_program(prog: ProgramMetrics) -> Dict[str, Any]:
     return {
         "program_id": prog.program_id,
         "total_e2el_s": full_time,
+        "start_time": start,
+        "end_time": end,
         "num_requests": len(prog.requests),
         "total_input_tokens": total_input_tokens,
         "total_output_tokens": total_output_tokens,
         "prog_ttft_s": prog_ttfts if prog_ttfts else None,
         "waiting_time_s": waiting_time,
         "service_time_s": service_time,
-
+        "max_request_tokens": max_request_tokens,
         "request_throughput_rps": safe_div(len(latencies), total_latency),
         "output_token_throughput": safe_div(total_output_tokens, total_latency),
         "total_token_throughput": safe_div(total_tokens, total_latency),
@@ -585,7 +591,7 @@ async def run_programs(
                     if data[1] is not None:
                         service_time = float(data[1])
                     else:
-                        waiting_time=-1
+                        service_time=-1
             return ProgramMetrics(program_id=pid, requests=req_metrics, waiting_time=waiting_time, service_time=service_time)
 
         # ----------------------------
@@ -701,17 +707,15 @@ async def benchmark_sharegpt(
     )
     
     # ---- per-program E2EL aggregation ----
-    e2el_values = np.array(
-        [p["total_e2el_ms"] for p in per_program_metrics if p.get("total_e2el_ms") is not None],
-        dtype=float
-    )
-
-    
+    e2el_values = np.array([p["total_e2el_s"] for p in per_program_metrics if p.get("total_e2el_s") is not None], dtype=float)
     if e2el_values.size:
         full_metrics["mean_e2el_per_program"] = float(np.mean(e2el_values))
         full_metrics["median_e2el_per_program"] = float(np.median(e2el_values))
+        full_metrics["p75_e2el_per_program"] = float(np.percentile(e2el_values, 75))
+        full_metrics["p90_e2el_per_program"] = float(np.percentile(e2el_values, 90))
         full_metrics["p95_e2el_per_program"] = float(np.percentile(e2el_values, 95))
         full_metrics["p99_e2el_per_program"] = float(np.percentile(e2el_values, 99))
+
 
     ttft_values = np.array(
         [p["prog_ttft_s"] for p in per_program_metrics if p.get("prog_ttft_s") is not None],

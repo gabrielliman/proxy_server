@@ -24,7 +24,7 @@ MODEL_ROUTES = json.loads(_env_model_routes) if _env_model_routes else _default_
 # nao funciona para o endpoint completions
 _default_backend_parallelism = {
     "http://localhost:8105": 15,
-    "http://localhost:8106": 15,
+    # "http://localhost:8106": 15,
 }
 _env_backend_parallelism = os.getenv("BACKEND_PARALLELISM")
 BACKEND_PARALLELISM = json.loads(_env_backend_parallelism) if _env_backend_parallelism else _default_backend_parallelism
@@ -79,3 +79,27 @@ LOAD_BALANCER_THRESHOLD_VALUE = float(os.getenv("LOAD_BALANCER_THRESHOLD_VALUE",
 
 # Options: "round-robin", "least-total-load", "least-waiting", "least-running", "least-kv-cache"
 LOAD_BALANCER_FALLBACK_STRATEGY = os.getenv("LOAD_BALANCER_FALLBACK_STRATEGY", "least-total-load")
+
+PROXY_PORT = int(os.getenv("PROXY_PORT", 8081))
+
+_enable_str = os.getenv("ENABLE_ADMISSION_CONTROL", "False").lower()
+ENABLE_ADMISSION_CONTROL = _enable_str in ("true", "1", "t", "yes")
+ADMISSION_WINDOW_S = float(os.getenv("ADMISSION_WINDOW_S", 10.0))        # Janela da média móvel em segundos
+# ADMISSION_THRESHOLD_PCT = float(os.getenv("ADMISSION_THRESHOLD_PCT", 0.8))    # 80% do limite máximo suportado (BACKEND_PARALLELISM)
+# ADMISSION_COOLDOWN_S = float(os.getenv("ADMISSION_COOLDOWN_S", 1.0))       # Tempo (em segundos) que a porta fica "fechada" após admitir um programa novo
+
+# O limite inicial de programas ao iniciar o proxy
+ADMISSION_INITIAL_LIMIT = 1.0
+
+# Additive Increase: Quantos programas adicionar por ciclo quando saudável
+AIMD_ALPHA = float(os.getenv("AIMD_ALPHA", 5.0))
+
+# Multiplicative Decrease: Fator de corte no trashing (0.75 = reduz 25%)
+AIMD_BETA = float(os.getenv("AIMD_BETA", 0.75))
+
+# Margens de tolerância para considerar que uma métrica "caiu" em relação à janela anterior
+AIMD_THROUGHPUT_DROP_TOLERANCE = float(os.getenv("AIMD_THROUGHPUT_DROP_TOLERANCE", 0.10))  # 10%
+AIMD_HIT_RATE_DROP_TOLERANCE = float(os.getenv("AIMD_HIT_RATE_DROP_TOLERANCE", 0.05))    # 5%
+
+# Caminho para o log de observabilidade do algoritmo
+AIMD_LOG_CSV = os.getenv("AIMD_LOG_CSV", "./var/logs/aimd_decisions.csv")
