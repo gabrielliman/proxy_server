@@ -32,11 +32,10 @@ class WorkerPoolDispatcher(BaseDispatcher):
             write=10.0,        
             pool=10.0
         )
-
         limits = httpx.Limits(
-            max_keepalive_connections=500, 
-            max_connections=2000,
-            keepalive_expiry=3.0
+            max_keepalive_connections=None,
+            max_connections=None,
+            keepalive_expiry=None 
         )
 
         WorkerPoolDispatcher.shared_client = httpx.AsyncClient(

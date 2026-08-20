@@ -4,7 +4,7 @@ kind: operation
 # tags: [examples]
 tags: [examples]
 queue: axia/default
-name: sharegpt_5000prog_4rate_noimp
+name: sharegpt_rateinf_noaimd_30mem
 component:
   kind: component
   run:
@@ -28,7 +28,7 @@ component:
       # storage local da axia, /scratch, que pode ser usado por qualquer
       # job ou usuário.
       # command: ["bash", "-c", "set -x; pwd; ls;  bash start_model_polyaxon.sh"]
-      command: ["bash", "-c", "set -x; nvidia-smi; bash sharegpt.sh"]
+      command: ["bash", "-c", "set -x; nvidia-smi; bash sharegpt_var.sh"]
       # command: ["bash", "-c", "set -x; pwd; ls; ls /scratch;"]
       # Defina ambos 'requests' e 'limits' para asegurar alocação exclusiva.
       resources:

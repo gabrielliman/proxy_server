@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import List, Dict, Any, Tuple
 import aiohttp
+from fastapi import requests
 import numpy as np
 from transformers import AutoTokenizer
 from tqdm import tqdm
@@ -546,7 +547,10 @@ async def run_programs(
 
     total_requests = sum(len(prompts) for _, prompts in program_requests)
 
-    async with aiohttp.ClientSession() as session:
+    timeout = aiohttp.ClientTimeout(total=None, connect=None, sock_read=None, sock_connect=None)
+    connector = aiohttp.TCPConnector(limit=0) # limit=0 significa sem limite de conexões
+    
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
 
         async def run_single_program(pid, prompts, pbar):
             """
@@ -581,17 +585,48 @@ async def run_programs(
 
                 req_metrics.append(rm)
                 pbar.update(1)
-                async with session.get(f"{base_url}/prog_time/{pid}") as response:
-                    # The response is a JSON list containing the two values
-                    data = await response.json()
-                    if data[0] is not None:
-                        waiting_time = float(data[0])
-                    else:
-                        waiting_time=-1
-                    if data[1] is not None:
-                        service_time = float(data[1])
-                    else:
-                        service_time=-1
+                max_retries = 5
+
+                # --- Retry block for the GET request ---
+                for attempt in range(max_retries):
+                    try:
+                        async with session.get(f"{base_url}/prog_time/{pid}") as response:
+                            # The response is a JSON list containing the two values
+                            data = await response.json()
+                            if data[0] is not None:
+                                waiting_time = float(data[0])
+                            else:
+                                waiting_time = -1
+                            if data[1] is not None:
+                                service_time = float(data[1])
+                            else:
+                                service_time = -1
+                        break  # Success! Break out of the retry loop
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                        if attempt == max_retries - 1:
+                            raise e  # Re-raise the exception if we've exhausted all retries
+                        await asyncio.sleep(2 ** attempt)  # Exponential backoff: wait 1s, 2s, 4s...
+
+
+                url = f"{base_url}/program/complete"
+                payload = {
+                    "program_id": pid,
+                    "task_idx": None,
+                    "status": None,
+                    "time_info": None
+                }
+
+                # --- Retry block for the POST request ---
+                for attempt in range(max_retries):
+                    try:
+                        response = await session.post(url, json=payload, timeout=60)
+                        # Note: Depending on your aiohttp version/usage, you may want to read the response 
+                        # or use `async with session.post(...) as response:` to ensure the connection closes cleanly.
+                        break  # Success! Break out of the retry loop
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                        if attempt == max_retries - 1:
+                            raise e
+                        await asyncio.sleep(2 ** attempt)
             return ProgramMetrics(program_id=pid, requests=req_metrics, waiting_time=waiting_time, service_time=service_time)
 
         # ----------------------------
@@ -634,11 +669,11 @@ async def benchmark_sharegpt(
 
     try:
         # Attempt to load the primary model's tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(model_name, model_max_length=10000)
+        tokenizer = AutoTokenizer.from_pretrained(model_name, model_max_length=40000)
         
     except Exception as e:
         from transformers import GPT2Tokenizer
-        tokenizer = GPT2Tokenizer.from_pretrained("gpt2", model_max_length=10000)
+        tokenizer = GPT2Tokenizer.from_pretrained("gpt2", model_max_length=40000)
     with open(dataset_path, "r", encoding="utf8") as f:
         data = json.load(f)
 

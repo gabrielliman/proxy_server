@@ -29,15 +29,16 @@ BASE_URL="http://localhost:${PROXY_PORT}" #proxy server url
 export ENABLE_ADMISSION_CONTROL="True"  # Altere para "False" para desligar
 export ADMISSION_WINDOW_S="10.0"        # Janela da média móvel em segundos
 export AIMD_LOG_CSV="./var/logs/aimd_decisions.csv"
-
+export AIMD_HIT_RATE_DROP_TOLERANCE="0.2"
+export AIMD_THROUGHPUT_DROP_TOLERANCE="0.2"
 
 MODEL="$MODEL_NAME"
 LIMIT=500
-OUTPUTS_DIR="outputs/sharegpt"
+OUTPUTS_DIR="outputs/teste_imp_sharegpt"
 mkdir -p "$OUTPUTS_DIR"
 CHAT_LEN=-10
 REPEATS=1
-RATES=("8")
+RATES=("4")
 # RATES=("0.5" "1" "2" "4" "8")
 BURSTINESS=1
 

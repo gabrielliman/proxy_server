@@ -19,7 +19,7 @@ PARALLELISM_VALUE=10000   # The parallelism value for all ports # changed for wa
 GPU=0 #starting gpu
 ENGINE_IDX=1  # Counter to create PID1, PID2, etc.
 PER_GPU=1
-GPU_PERCENT=0.97
+GPU_PERCENT=0.30
 MAX_MODEL_LEN=40000 #40000
 
 # Lats parameters
@@ -31,11 +31,11 @@ export ADMISSION_WINDOW_S="10.0"        # Janela da média móvel em segundos
 export AIMD_LOG_CSV="./var/logs/aimd_decisions.csv"
 export AIMD_ALPHA="5.0"            # Fator de aumento do AIMD
 export AIMD_BETA="0.75"             # Fator de diminuição do AIM
-export AIMD_THROUGHPUT_DROP_TOLERANCE="0.10"  # Tolerância de queda de throughput para acionar o AIMD
-export AIMD_HIT_RATE_DROP_TOLERANCE="0.05" 
+export AIMD_THROUGHPUT_DROP_TOLERANCE="0.20"  # Tolerância de queda de throughput para acionar o AIMD
+export AIMD_HIT_RATE_DROP_TOLERANCE="0.2" 
 
 MODEL="$MODEL_NAME"
-LIMIT=5000
+LIMIT=500
 OUTPUTS_DIR="outputs/sharegpt_5000prog_4rate_noimp"
 mkdir -p "$OUTPUTS_DIR"
 CHAT_LEN=-1

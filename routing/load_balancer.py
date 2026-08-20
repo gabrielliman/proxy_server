@@ -984,13 +984,26 @@ class LoadBalancer:
         now = time.time()
         
         with self.aimd_lock:
-            if current_tokens > 0:
-                self.has_received_traffic = True
-                # NOVO: Adicionado running, waiting e kv_cache na tupla do histórico
-                self.raw_metrics_history.append((
-                    now, current_hits, current_queries, current_tokens, 
-                    total_running, total_waiting, avg_kv_cache
-                ))
+            # --- NOVO: LÓGICA DE IGNORAR MEDIÇÕES INÚTEIS ---
+            if self.raw_metrics_history:
+                last_record = self.raw_metrics_history[-1]
+                delta_queries = current_queries - last_record[2]
+                
+                # Se não houve novas requisições (hit rate = 1) e não houve tokens gerados (throughput = 0)
+                if delta_queries == 0:
+                    return  # Ignora a medição, não adiciona na janela, não toma decisão (HOLD)
+            elif current_tokens == 0:
+                # Retorna silenciosamente até que o primeiro tráfego chegue
+                return
+            # ------------------------------------------------
+            
+            self.has_received_traffic = True
+            
+            # NOVO: Adicionado running, waiting e kv_cache na tupla do histórico
+            self.raw_metrics_history.append((
+                now, current_hits, current_queries, current_tokens, 
+                total_running, total_waiting, avg_kv_cache
+            ))
                 
             window_s = getattr(settings, 'ADMISSION_WINDOW_S', 10.0)
             history_limit_s = window_s * 2.0 
@@ -1004,6 +1017,7 @@ class LoadBalancer:
                     mid_idx = i
                     break
                     
+            # Se a janela não tiver dados suficientes (ex: ignoramos muitos pontos por falta de tráfego)
             if mid_idx == -1:
                 return
                 
@@ -1074,7 +1088,7 @@ class LoadBalancer:
 
                 real_tp_drop = tp_dropped # and (insta_waiting > 0)
                 
-                if hr_dropped or real_tp_drop:
+                if hr_dropped and real_tp_drop:
                     if not in_cooldown:
                         self.aimd_current_limit = max(2.0, self.aimd_current_limit * self.aimd_beta)
                         self.last_punishment_time = now
@@ -1100,7 +1114,7 @@ class LoadBalancer:
                     insta_running, insta_waiting, insta_kv
                 )
 
-    def can_admit_new_program(self) -> bool:
+    def can_admit_new_program(self) -> bool: #nao ta sendo usado
         """Calcula a média móvel e decide se o cluster tem capacidade para novos programas."""
         if not getattr(settings, 'ENABLE_ADMISSION_CONTROL', False):
             self.last_admission_time = time.time()
@@ -1120,7 +1134,7 @@ class LoadBalancer:
             total_load = sum(count for _, count in self.load_history)
             avg_load = total_load / len(self.load_history)
 
-        max_capacity = 512
+        max_capacity = 512 
         threshold_pct = getattr(settings, 'ADMISSION_THRESHOLD_PCT', 0.8)
 
         if (avg_load < (max_capacity * threshold_pct)):

@@ -42,4 +42,4 @@ app.include_router(status_router)
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=PROXY_PORT)
+    uvicorn.run("main:app", host="0.0.0.0", port=PROXY_PORT, limit_concurrency=None, backlog=65536)
